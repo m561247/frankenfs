@@ -647,6 +647,163 @@ mod tests {
         assert!(outcome.recovered.is_empty());
     }
 
+    // ── Property-based tests (proptest) ────────────────────────────────
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        /// Encode → decode roundtrip: for any random source data with
+        /// corruption_count ≤ repair_count, all corrupt blocks are recovered
+        /// exactly.
+        #[test]
+        fn proptest_encode_decode_roundtrip(
+            k in 4_u32..20,
+            repair_extra in 0_u32..4,
+            corrupt_count in 1_u32..4,
+            fill_byte in any::<u8>(),
+        ) {
+            let cx = Cx::for_testing();
+            let block_size = 64_u32;
+            let repair_count = corrupt_count + repair_extra + 8;
+            let actual_corrupt = corrupt_count.min(k);
+
+            let device = MemBlockDevice::new(block_size, u64::from(k) * 2);
+            for i in 0..u64::from(k) {
+                let data: Vec<u8> = (0..block_size as usize)
+                    .map(|j| fill_byte.wrapping_add(u8::try_from(i % 256).unwrap()).wrapping_add(u8::try_from(j % 256).unwrap()))
+                    .collect();
+                device.write(BlockNumber(i), data);
+            }
+
+            let uuid = test_uuid();
+            let group = GroupNumber(0);
+
+            let encoded = encode_group(&cx, &device, &uuid, group, BlockNumber(0), k, repair_count)
+                .expect("encode should succeed");
+
+            let repair_data: Vec<(u32, Vec<u8>)> = encoded
+                .repair_symbols
+                .iter()
+                .map(|s| (s.esi, s.data.clone()))
+                .collect();
+
+            // Corrupt the first `actual_corrupt` blocks.
+            let corrupt_indices: Vec<u32> = (0..actual_corrupt).collect();
+            let originals: Vec<Vec<u8>> = corrupt_indices
+                .iter()
+                .map(|&i| {
+                    (0..block_size as usize)
+                        .map(|j| fill_byte.wrapping_add(u8::try_from(u64::from(i) % 256).unwrap()).wrapping_add(u8::try_from(j % 256).unwrap()))
+                        .collect()
+                })
+                .collect();
+
+            let outcome = decode_group(
+                &cx,
+                &device,
+                &uuid,
+                group,
+                BlockNumber(0),
+                k,
+                &corrupt_indices,
+                &repair_data,
+            )
+            .expect("decode should succeed with sufficient repair symbols");
+
+            prop_assert!(outcome.complete);
+            prop_assert_eq!(outcome.recovered.len(), actual_corrupt as usize);
+            for (i, recovered) in outcome.recovered.iter().enumerate() {
+                prop_assert_eq!(
+                    &recovered.data, &originals[i],
+                    "block {} data mismatch", corrupt_indices[i]
+                );
+            }
+        }
+
+        /// Encoding is deterministic: same inputs always produce same repair
+        /// symbols.
+        #[test]
+        fn proptest_encode_deterministic(
+            k in 4_u32..16,
+            repair_count in 1_u32..8,
+            fill_byte in any::<u8>(),
+            group_idx in 0_u32..100,
+        ) {
+            let cx = Cx::for_testing();
+            let block_size = 64_u32;
+            let device = MemBlockDevice::new(block_size, u64::from(k) * 2);
+            for i in 0..u64::from(k) {
+                let data: Vec<u8> = vec![fill_byte.wrapping_add(u8::try_from(i % 256).unwrap()); block_size as usize];
+                device.write(BlockNumber(i), data);
+            }
+
+            let uuid = test_uuid();
+            let group = GroupNumber(group_idx);
+
+            let enc1 = encode_group(&cx, &device, &uuid, group, BlockNumber(0), k, repair_count)
+                .expect("first encode should succeed");
+            let enc2 = encode_group(&cx, &device, &uuid, group, BlockNumber(0), k, repair_count)
+                .expect("second encode should succeed");
+
+            prop_assert_eq!(enc1.repair_symbols.len(), enc2.repair_symbols.len());
+            for (s1, s2) in enc1.repair_symbols.iter().zip(enc2.repair_symbols.iter()) {
+                prop_assert_eq!(s1.esi, s2.esi);
+                prop_assert_eq!(&s1.data, &s2.data);
+            }
+        }
+
+        /// Different groups produce different seeds (and therefore different
+        /// repair symbols) even with identical source data.
+        #[test]
+        fn proptest_different_groups_different_seeds(
+            k in 4_u32..12,
+            group_a in 0_u32..1000,
+            group_b in 0_u32..1000,
+            fill_byte in any::<u8>(),
+        ) {
+            prop_assume!(group_a != group_b);
+            let cx = Cx::for_testing();
+            let block_size = 64_u32;
+            let device = MemBlockDevice::new(block_size, u64::from(k) * 2);
+            for i in 0..u64::from(k) {
+                device.write(BlockNumber(i), vec![fill_byte; block_size as usize]);
+            }
+
+            let uuid = test_uuid();
+            let enc_a = encode_group(&cx, &device, &uuid, GroupNumber(group_a), BlockNumber(0), k, 2)
+                .expect("encode group_a");
+            let enc_b = encode_group(&cx, &device, &uuid, GroupNumber(group_b), BlockNumber(0), k, 2)
+                .expect("encode group_b");
+
+            prop_assert_ne!(enc_a.seed, enc_b.seed);
+        }
+
+        /// Repair symbol count matches requested count.
+        #[test]
+        fn proptest_repair_count_matches_request(
+            k in 4_u32..16,
+            repair_count in 0_u32..16,
+        ) {
+            let cx = Cx::for_testing();
+            let block_size = 64_u32;
+            let device = setup_device(k, block_size);
+            let uuid = test_uuid();
+            let group = GroupNumber(0);
+
+            let encoded = encode_group(&cx, &device, &uuid, group, BlockNumber(0), k, repair_count)
+                .expect("encode");
+
+            prop_assert_eq!(
+                encoded.repair_symbols.len(),
+                repair_count as usize
+            );
+            prop_assert_eq!(encoded.source_block_count, k);
+            prop_assert_eq!(encoded.symbol_size, block_size);
+        }
+    }
+
     #[test]
     fn fault_injection_progressive_corruption() {
         // Verify that decode succeeds with sufficient redundancy and fails

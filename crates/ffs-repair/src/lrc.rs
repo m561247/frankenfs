@@ -771,6 +771,188 @@ mod tests {
         assert_eq!(parsed, cfg);
     }
 
+    // ── Property-based tests (proptest) ────────────────────────────────
+
+    use proptest::prelude::*;
+
+    fn valid_lrc_config_strategy() -> impl Strategy<Value = (u32, u32, u32)> {
+        // group_size in {2, 4}, num_groups in {2..6}, global_parity in {1, 2}
+        (
+            prop::sample::select(vec![2_u32, 4]),
+            2_u32..6,
+            prop::sample::select(vec![1_u32, 2]),
+        )
+            .prop_map(|(group_size, num_groups, global_parity)| {
+                let data_blocks = group_size * num_groups;
+                (data_blocks, group_size, global_parity)
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// XOR of local group data always equals local parity.
+        #[test]
+        fn proptest_local_parity_xor_identity(
+            (data_blocks, group_size, global_parity) in valid_lrc_config_strategy(),
+            fill_byte in any::<u8>(),
+        ) {
+            let cfg = LrcConfig::new(data_blocks, group_size, global_parity);
+            let block_size = 32_usize;
+            let data: Vec<Vec<u8>> = (0..data_blocks as usize)
+                .map(|i| {
+                    vec![fill_byte.wrapping_add(u8::try_from(i % 256).unwrap()); block_size]
+                })
+                .collect();
+
+            let local = encode_local(&cfg, &data);
+            prop_assert_eq!(local.len(), cfg.num_groups() as usize);
+
+            for g in 0..cfg.num_groups() as usize {
+                let base = g * group_size as usize;
+                let mut expected = vec![0_u8; block_size];
+                for i in 0..group_size as usize {
+                    xor_into(&mut expected, &data[base + i]);
+                }
+                prop_assert_eq!(&local[g], &expected, "group {} parity mismatch", g);
+            }
+        }
+
+        /// Local repair recovers any single lost block within any group.
+        #[test]
+        fn proptest_local_repair_single_block(
+            (data_blocks, group_size, global_parity) in valid_lrc_config_strategy(),
+            fill_byte in any::<u8>(),
+            group_selector in 0_u32..6,
+            missing_selector in 0_u32..4,
+        ) {
+            let cfg = LrcConfig::new(data_blocks, group_size, global_parity);
+            let num_groups = cfg.num_groups();
+            let group_idx = group_selector % num_groups;
+            let missing_in_group = missing_selector % group_size;
+
+            let block_size = 32_usize;
+            let data: Vec<Vec<u8>> = (0..data_blocks as usize)
+                .map(|i| {
+                    (0..block_size)
+                        .map(|j| fill_byte.wrapping_add(u8::try_from((i + j) % 256).unwrap()))
+                        .collect()
+                })
+                .collect();
+
+            let local = encode_local(&cfg, &data);
+            let base = group_idx as usize * group_size as usize;
+
+            let available: Vec<Option<&[u8]>> = (0..group_size as usize)
+                .map(|i| {
+                    if i == missing_in_group as usize {
+                        None
+                    } else {
+                        Some(data[base + i].as_slice())
+                    }
+                })
+                .collect();
+
+            let recovered = repair_local_single(
+                &cfg,
+                group_idx,
+                missing_in_group,
+                &available,
+                &local[group_idx as usize],
+            );
+
+            prop_assert!(recovered.is_some(), "local repair should succeed for single failure");
+            prop_assert_eq!(
+                &recovered.unwrap(),
+                &data[base + missing_in_group as usize],
+                "recovered block mismatch"
+            );
+        }
+
+        /// Config total_blocks = data + local_parity + global_parity.
+        #[test]
+        fn proptest_config_total_blocks(
+            (data_blocks, group_size, global_parity) in valid_lrc_config_strategy(),
+        ) {
+            let cfg = LrcConfig::new(data_blocks, group_size, global_parity);
+            let num_groups = cfg.num_groups();
+            prop_assert_eq!(
+                cfg.total_blocks(),
+                data_blocks + num_groups + global_parity
+            );
+            prop_assert_eq!(num_groups * group_size, data_blocks);
+        }
+
+        /// Global repair succeeds for up to global_parity_count failures.
+        #[test]
+        fn proptest_global_repair_within_budget(
+            (data_blocks, group_size, global_parity) in valid_lrc_config_strategy(),
+            fill_byte in any::<u8>(),
+            failure_selector in 0_u32..20,
+        ) {
+            let cfg = LrcConfig::new(data_blocks, group_size, global_parity);
+            let num_failures = (failure_selector % global_parity).saturating_add(1)
+                .min(data_blocks);
+
+            let block_size = 32_usize;
+            let data: Vec<Vec<u8>> = (0..data_blocks as usize)
+                .map(|i| {
+                    (0..block_size)
+                        .map(|j| fill_byte.wrapping_add(u8::try_from((i * 7 + j * 3) % 256).unwrap()))
+                        .collect()
+                })
+                .collect();
+
+            let global = encode_global(&cfg, &data);
+
+            // Lose the first num_failures blocks.
+            let mut data_availability: Vec<Option<Vec<u8>>> = data
+                .iter()
+                .map(|b| Some(b.clone()))
+                .collect();
+            for i in 0..num_failures as usize {
+                data_availability[i] = None;
+            }
+
+            let availability = BlockAvailability {
+                data: data_availability,
+                local_parity: vec![],
+                global_parity: global.iter().map(|p| Some(p.clone())).collect(),
+            };
+
+            let result = repair_global(&cfg, &availability, block_size);
+            prop_assert!(
+                result.success,
+                "global repair should succeed with {} failures and {} global parities",
+                num_failures,
+                global_parity,
+            );
+            prop_assert_eq!(result.blocks_repaired, num_failures);
+        }
+
+        /// Overhead fraction is always positive and <= 1.0 for sensible configs.
+        #[test]
+        fn proptest_overhead_fraction_bounded(
+            (data_blocks, group_size, global_parity) in valid_lrc_config_strategy(),
+        ) {
+            let cfg = LrcConfig::new(data_blocks, group_size, global_parity);
+            let overhead = cfg.overhead_fraction();
+            prop_assert!(overhead > 0.0);
+            prop_assert!(overhead <= 1.0);
+        }
+
+        /// LrcConfig serialization roundtrip.
+        #[test]
+        fn proptest_config_serde_roundtrip(
+            (data_blocks, group_size, global_parity) in valid_lrc_config_strategy(),
+        ) {
+            let cfg = LrcConfig::new(data_blocks, group_size, global_parity);
+            let json = serde_json::to_string(&cfg).expect("serialize");
+            let parsed: LrcConfig = serde_json::from_str(&json).expect("deserialize");
+            prop_assert_eq!(parsed, cfg);
+        }
+    }
+
     #[test]
     fn no_failures_returns_trivial_success() {
         let cfg = LrcConfig::new(4, 2, 2);
