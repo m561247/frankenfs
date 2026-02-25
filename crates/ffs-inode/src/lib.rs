@@ -1450,5 +1450,197 @@ mod tests {
             let result = locate_inode(InodeNumber(ino_raw), &geo, &groups);
             prop_assert!(result.is_none(), "ino {} should be out of range", ino_raw);
         }
+
+        /// Valid inodes (1..=total_inodes) always resolve to a valid InodeLocation.
+        #[test]
+        fn proptest_locate_inode_in_range_valid(
+            ino_raw in 1_u64..=8192,
+        ) {
+            let geo = make_geometry();
+            let groups = make_groups(&geo);
+            let loc = locate_inode(InodeNumber(ino_raw), &geo, &groups);
+            prop_assert!(loc.is_some(), "ino {} should be locatable", ino_raw);
+            let loc = loc.unwrap();
+            // byte_offset must be within a block.
+            prop_assert!(loc.byte_offset + usize::from(geo.inode_size) <= geo.block_size as usize,
+                "inode {} byte_offset {} + inode_size {} exceeds block_size {}",
+                ino_raw, loc.byte_offset, geo.inode_size, geo.block_size);
+        }
+
+        /// compute_and_set_checksum → verify_inode_checksum roundtrip succeeds.
+        #[test]
+        fn proptest_checksum_roundtrip(
+            csum_seed in any::<u32>(),
+            ino in 1_u32..100_000,
+            generation in any::<u32>(),
+            mode in any::<u16>(),
+            uid_lo in any::<u16>(),
+        ) {
+            let mut inode = Ext4Inode {
+                mode, uid: u32::from(uid_lo), gid: 0, size: 0,
+                links_count: 1, blocks: 0, flags: 0, generation,
+                file_acl: 0, atime: 0, ctime: 0, mtime: 0, dtime: 0,
+                atime_extra: 0, ctime_extra: 0, mtime_extra: 0,
+                crtime: 0, crtime_extra: 0, extra_isize: 32,
+                checksum: 0, projid: 0,
+                extent_bytes: vec![0u8; 60], xattr_ibody: Vec::new(),
+            };
+            // Ensure generation matches what will be in the raw buffer.
+            let _ = &mut inode;
+            let mut raw = serialize_inode(&inode, 256);
+            compute_and_set_checksum(&mut raw, csum_seed, ino);
+            let result = ffs_ondisk::verify_inode_checksum(&raw, csum_seed, ino, 256);
+            prop_assert!(result.is_ok(), "checksum verification failed for seed={csum_seed:#x} ino={ino}: {result:?}");
+        }
+
+        /// write_inode → read_inode preserves all core inode fields.
+        #[test]
+        fn proptest_write_read_roundtrip(
+            mode_bits in 0_u16..0o7777,
+            uid in any::<u32>(),
+            gid in any::<u32>(),
+            size in 0_u64..(1_u64 << 48),
+            links_count in 1_u16..1000,
+            generation in any::<u32>(),
+            atime_val in any::<u32>(),
+            mtime_val in any::<u32>(),
+        ) {
+            let cx = test_cx();
+            let dev = MemBlockDevice::new(4096);
+            let geo = make_geometry();
+            let groups = make_groups(&geo);
+            let mode = 0o100_000 | mode_bits;
+
+            let inode = Ext4Inode {
+                mode, uid, gid, size, links_count, blocks: 0, flags: 0, generation,
+                file_acl: 0, atime: atime_val, ctime: 0, mtime: mtime_val, dtime: 0,
+                atime_extra: 0, ctime_extra: 0, mtime_extra: 0,
+                crtime: 0, crtime_extra: 0, extra_isize: 32,
+                checksum: 0, projid: 0,
+                extent_bytes: vec![0u8; 60], xattr_ibody: Vec::new(),
+            };
+
+            let ino = InodeNumber(1);
+            write_inode(&cx, &dev, &geo, &groups, ino, &inode, 0).unwrap();
+            let read_back = read_inode(&cx, &dev, &geo, &groups, ino).unwrap();
+
+            prop_assert_eq!(read_back.mode, mode);
+            prop_assert_eq!(read_back.uid, uid);
+            prop_assert_eq!(read_back.gid, gid);
+            prop_assert_eq!(read_back.size, size);
+            prop_assert_eq!(read_back.links_count, links_count);
+            prop_assert_eq!(read_back.generation, generation);
+            prop_assert_eq!(read_back.atime, atime_val);
+            prop_assert_eq!(read_back.mtime, mtime_val);
+        }
+
+        /// serialize → parse roundtrip preserves all timestamp fields.
+        #[test]
+        fn proptest_serialize_timestamps_preserved(
+            atime in any::<u32>(),
+            ctime in any::<u32>(),
+            mtime in any::<u32>(),
+            dtime in any::<u32>(),
+            atime_extra in any::<u32>(),
+            ctime_extra in any::<u32>(),
+            mtime_extra in any::<u32>(),
+            crtime in any::<u32>(),
+        ) {
+            let inode = Ext4Inode {
+                mode: 0o100_644, uid: 0, gid: 0, size: 0,
+                links_count: 1, blocks: 0, flags: 0, generation: 0,
+                file_acl: 0, atime, ctime, mtime, dtime,
+                atime_extra, ctime_extra, mtime_extra,
+                crtime, crtime_extra: 0, extra_isize: 32,
+                checksum: 0, projid: 0,
+                extent_bytes: vec![0u8; 60], xattr_ibody: Vec::new(),
+            };
+
+            let raw = serialize_inode(&inode, 256);
+            let parsed = Ext4Inode::parse_from_bytes(&raw).unwrap();
+
+            prop_assert_eq!(parsed.atime, atime);
+            prop_assert_eq!(parsed.ctime, ctime);
+            prop_assert_eq!(parsed.mtime, mtime);
+            prop_assert_eq!(parsed.dtime, dtime);
+            prop_assert_eq!(parsed.atime_extra, atime_extra);
+            prop_assert_eq!(parsed.ctime_extra, ctime_extra);
+            prop_assert_eq!(parsed.mtime_extra, mtime_extra);
+            prop_assert_eq!(parsed.crtime, crtime);
+        }
+
+        /// touch_ctime modifies only ctime fields, preserving atime and mtime.
+        #[test]
+        fn proptest_touch_ctime_isolation(
+            secs in 0_u64..=0x3_FFFF_FFFF_u64,
+            nsec in 0_u32..1_000_000_000,
+            init_atime in any::<u32>(),
+            init_mtime in any::<u32>(),
+            init_atime_extra in any::<u32>(),
+            init_mtime_extra in any::<u32>(),
+        ) {
+            let mut inode = Ext4Inode {
+                mode: 0o100_644, uid: 0, gid: 0, size: 0,
+                links_count: 1, blocks: 0, flags: 0, generation: 0,
+                file_acl: 0, atime: init_atime, ctime: 0, mtime: init_mtime, dtime: 0,
+                atime_extra: init_atime_extra, ctime_extra: 0, mtime_extra: init_mtime_extra,
+                crtime: 0, crtime_extra: 0, extra_isize: 32,
+                checksum: 0, projid: 0,
+                extent_bytes: vec![0u8; 60], xattr_ibody: Vec::new(),
+            };
+
+            touch_ctime(&mut inode, secs, nsec);
+
+            prop_assert_eq!(inode.atime, init_atime, "atime must not change");
+            prop_assert_eq!(inode.atime_extra, init_atime_extra, "atime_extra must not change");
+            prop_assert_eq!(inode.mtime, init_mtime, "mtime must not change");
+            prop_assert_eq!(inode.mtime_extra, init_mtime_extra, "mtime_extra must not change");
+            prop_assert_eq!(inode.ctime, secs as u32, "ctime lower 32 bits");
+            prop_assert_eq!(inode.ctime_extra, encode_extra_timestamp(secs, nsec), "ctime_extra");
+        }
+
+        /// serialize → parse roundtrip preserves 48-bit file_acl field.
+        #[test]
+        fn proptest_serialize_file_acl_roundtrip(
+            file_acl in 0_u64..(1_u64 << 48),
+        ) {
+            let inode = Ext4Inode {
+                mode: 0o100_644, uid: 0, gid: 0, size: 0,
+                links_count: 1, blocks: 0, flags: 0, generation: 0,
+                file_acl, atime: 0, ctime: 0, mtime: 0, dtime: 0,
+                atime_extra: 0, ctime_extra: 0, mtime_extra: 0,
+                crtime: 0, crtime_extra: 0, extra_isize: 32,
+                checksum: 0, projid: 0,
+                extent_bytes: vec![0u8; 60], xattr_ibody: Vec::new(),
+            };
+
+            let raw = serialize_inode(&inode, 256);
+            let parsed = Ext4Inode::parse_from_bytes(&raw).unwrap();
+            prop_assert_eq!(parsed.file_acl, file_acl, "file_acl 48-bit roundtrip failed");
+        }
+
+        /// serialize → parse roundtrip preserves xattr ibody bytes.
+        #[test]
+        fn proptest_serialize_xattr_ibody_roundtrip(
+            xattr_len in 0_usize..64,
+            fill_byte in any::<u8>(),
+        ) {
+            let xattr_data = vec![fill_byte; xattr_len];
+            let inode = Ext4Inode {
+                mode: 0o100_644, uid: 0, gid: 0, size: 0,
+                links_count: 1, blocks: 0, flags: 0, generation: 0,
+                file_acl: 0, atime: 0, ctime: 0, mtime: 0, dtime: 0,
+                atime_extra: 0, ctime_extra: 0, mtime_extra: 0,
+                crtime: 0, crtime_extra: 0, extra_isize: 32,
+                checksum: 0, projid: 0,
+                extent_bytes: vec![0u8; 60], xattr_ibody: xattr_data.clone(),
+            };
+
+            let raw = serialize_inode(&inode, 256);
+            // Inline xattrs start at offset 128 + extra_isize = 160.
+            let xattr_start = 160;
+            prop_assert_eq!(&raw[xattr_start..xattr_start + xattr_len], &xattr_data[..],
+                "xattr ibody bytes not preserved");
+        }
     }
 }
