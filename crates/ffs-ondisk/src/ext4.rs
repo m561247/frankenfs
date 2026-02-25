@@ -2671,7 +2671,13 @@ impl Ext4ImageReader {
                     let len = u32::from(ext.actual_len());
                     if logical_block >= start && logical_block < start.saturating_add(len) {
                         let offset_within = u64::from(logical_block - start);
-                        return Ok(Some(ext.physical_start + offset_within));
+                        let phys = ext.physical_start.checked_add(offset_within).ok_or(
+                            ParseError::InvalidField {
+                                field: "ee_start",
+                                reason: "physical block + offset overflow",
+                            },
+                        )?;
+                        return Ok(Some(phys));
                     }
                 }
                 // Hole — no extent covers this logical block

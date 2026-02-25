@@ -409,5 +409,206 @@ mod tests {
                     || (low_overhead - high_overhead) <= CANDIDATE_STEP
             );
         }
+
+        /// `posterior_mean()` always returns a value in [0, 1].
+        #[test]
+        fn proptest_posterior_mean_in_unit_interval(
+            alpha in -100.0_f64..1_000_000.0,
+            beta in -100.0_f64..1_000_000.0,
+        ) {
+            let ap = DurabilityAutopilot { alpha, beta, ..DurabilityAutopilot::default() };
+            let mean = ap.posterior_mean();
+            prop_assert!((0.0..=1.0).contains(&mean), "posterior_mean {} out of [0,1]", mean);
+        }
+
+        /// `risk_bound()` always returns a value in [0, 1].
+        #[test]
+        fn proptest_risk_bound_in_unit_interval(
+            alpha in 0.001_f64..1000.0,
+            beta in 0.001_f64..1000.0,
+            overhead in 0.0_f64..1.0,
+            source_blocks in 0_u32..512,
+        ) {
+            let ap = DurabilityAutopilot { alpha, beta, ..DurabilityAutopilot::default() };
+            let risk = ap.risk_bound(overhead, source_blocks);
+            prop_assert!(
+                (0.0..=1.0).contains(&risk),
+                "risk_bound {} out of [0,1] for alpha={}, beta={}, overhead={}, blocks={}",
+                risk, alpha, beta, overhead, source_blocks
+            );
+        }
+
+        /// `risk_bound()` returns 0 when overhead >= 1.0 (full redundancy).
+        #[test]
+        fn proptest_risk_bound_zero_at_full_overhead(
+            alpha in 0.001_f64..100.0,
+            beta in 0.001_f64..100.0,
+            source_blocks in 1_u32..1024,
+        ) {
+            let ap = DurabilityAutopilot { alpha, beta, ..DurabilityAutopilot::default() };
+            let risk = ap.risk_bound(1.0, source_blocks);
+            prop_assert!(
+                risk.abs() < 1e-12,
+                "risk_bound at overhead=1.0 should be 0, got {}",
+                risk
+            );
+        }
+
+        /// `beta_binomial_tail()` always returns a value in [0, 1].
+        #[test]
+        fn proptest_beta_binomial_tail_in_unit_interval(
+            alpha in 0.001_f64..100.0,
+            beta in 0.001_f64..100.0,
+            draws in 1_u32..128,
+            cutoff_frac in 0.0_f64..1.0,
+        ) {
+            let cutoff = floor_to_u32(f64::from(draws) * cutoff_frac, draws);
+            let tail = beta_binomial_tail(alpha, beta, draws, cutoff);
+            prop_assert!(
+                (0.0..=1.0).contains(&tail),
+                "beta_binomial_tail {} out of [0,1] for alpha={}, beta={}, draws={}, cutoff={}",
+                tail, alpha, beta, draws, cutoff
+            );
+        }
+
+        /// `beta_binomial_tail()` is monotonically non-increasing in cutoff.
+        #[test]
+        fn proptest_beta_binomial_tail_monotonic_in_cutoff(
+            alpha in 0.1_f64..50.0,
+            beta in 0.1_f64..50.0,
+            draws in 2_u32..64,
+            lo in 0_u32..32,
+            delta in 1_u32..32,
+        ) {
+            let lo = lo.min(draws.saturating_sub(1));
+            let hi = lo.saturating_add(delta).min(draws.saturating_sub(1));
+            if lo < hi {
+                let tail_lo = beta_binomial_tail(alpha, beta, draws, lo);
+                let tail_hi = beta_binomial_tail(alpha, beta, draws, hi);
+                prop_assert!(
+                    tail_lo + 1e-12 >= tail_hi,
+                    "tail not monotonic: cutoff {} → {}, cutoff {} → {}",
+                    lo, tail_lo, hi, tail_hi
+                );
+            }
+        }
+
+        /// `log_add_exp()` is commutative.
+        #[test]
+        fn proptest_log_add_exp_commutative(
+            a in -100.0_f64..100.0,
+            b in -100.0_f64..100.0,
+        ) {
+            let ab = log_add_exp(a, b);
+            let ba = log_add_exp(b, a);
+            prop_assert!(
+                (ab - ba).abs() < 1e-10,
+                "log_add_exp not commutative: ({}, {}) → {}, ({}, {}) → {}",
+                a, b, ab, b, a, ba
+            );
+        }
+
+        /// `log_add_exp(a, NEG_INFINITY)` returns `a`.
+        #[test]
+        fn proptest_log_add_exp_identity(a in -100.0_f64..100.0) {
+            let result = log_add_exp(a, f64::NEG_INFINITY);
+            prop_assert!(
+                (result - a).abs() < 1e-12,
+                "log_add_exp({}, -inf) = {}, expected {}",
+                a, result, a
+            );
+        }
+
+        /// `floor_to_u32()` returns a value <= the input and >= input - 1.
+        #[test]
+        fn proptest_floor_to_u32_accuracy(
+            value in 0.0_f64..1_000_000.0,
+            upper in 1_u32..=u32::MAX,
+        ) {
+            let result = floor_to_u32(value, upper);
+            let f_result = f64::from(result);
+            // result <= value (it's a floor)
+            prop_assert!(
+                f_result <= value + 1e-9,
+                "floor_to_u32({}, {}) = {} exceeds input",
+                value, upper, result
+            );
+            // result >= value - 1 (within one of the true floor)
+            if value < f64::from(upper) {
+                prop_assert!(
+                    f_result >= value - 1.0 - 1e-9,
+                    "floor_to_u32({}, {}) = {} too far below input",
+                    value, upper, result
+                );
+            }
+            // result <= upper
+            prop_assert!(result <= upper);
+        }
+
+        /// `optimal_overhead()` always returns a value within bounds.
+        #[test]
+        fn proptest_optimal_overhead_within_bounds(
+            corrupted in 0_u64..10_000,
+            checked in 1_u64..20_000,
+            source_blocks in 1_u32..4096,
+        ) {
+            let mut ap = DurabilityAutopilot::default();
+            ap.update_posterior(corrupted.min(checked), checked);
+            let overhead = ap.optimal_overhead(source_blocks);
+            prop_assert!(
+                overhead >= ap.min_overhead - 1e-12 && overhead <= ap.max_overhead + 1e-12,
+                "optimal_overhead {} not in [{}, {}]",
+                overhead, ap.min_overhead, ap.max_overhead
+            );
+        }
+
+        /// `symbol_count_for_overhead()` is bounded by source_block_count.
+        #[test]
+        fn proptest_symbol_count_bounded(
+            source_blocks in 0_u32..65536,
+            overhead in 0.0_f64..2.0,
+        ) {
+            let count = DurabilityAutopilot::symbol_count_for_overhead(source_blocks, overhead);
+            prop_assert!(
+                count <= source_blocks,
+                "symbol_count {} > source_blocks {}",
+                count, source_blocks
+            );
+        }
+
+        /// `expected_loss()` is always non-negative and finite.
+        #[test]
+        fn proptest_expected_loss_nonneg_finite(
+            alpha in 0.001_f64..1000.0,
+            beta in 0.001_f64..1000.0,
+            overhead in 0.0_f64..1.0,
+            source_blocks in 0_u32..512,
+        ) {
+            let ap = DurabilityAutopilot { alpha, beta, ..DurabilityAutopilot::default() };
+            let loss = ap.expected_loss(overhead, source_blocks);
+            prop_assert!(loss >= 0.0, "expected_loss {} < 0", loss);
+            prop_assert!(loss.is_finite(), "expected_loss is not finite");
+        }
+
+        /// Posterior alpha + beta increases monotonically with observations.
+        #[test]
+        fn proptest_posterior_params_grow_with_observations(
+            corrupted in 0_u64..1000,
+            checked in 1_u64..10_000,
+        ) {
+            let mut ap = DurabilityAutopilot::default();
+            let (a0, b0) = ap.posterior_params();
+            let sum_before = a0 + b0;
+
+            ap.update_posterior(corrupted.min(checked), checked);
+            let (a1, b1) = ap.posterior_params();
+            let sum_after = a1 + b1;
+
+            prop_assert!(
+                sum_after >= sum_before - 1e-12,
+                "posterior sum decreased: {} → {}",
+                sum_before, sum_after
+            );
+        }
     }
 }

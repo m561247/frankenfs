@@ -526,6 +526,15 @@ enum XattrReplyPlan {
     Error(c_int),
 }
 
+#[derive(Debug)]
+enum MutationDispatchError {
+    Errno(c_int),
+    Operation {
+        error: FfsError,
+        offset: Option<u64>,
+    },
+}
+
 impl FrankenFuse {
     /// Create a new FUSE adapter wrapping the given `FsOps` implementation.
     ///
@@ -740,6 +749,103 @@ impl FrankenFuse {
                 Err(op_err)
             }
         }
+    }
+
+    fn enforce_mutation_guards(
+        &self,
+        op: RequestOp,
+        ino_for_logging: u64,
+    ) -> Result<(), MutationDispatchError> {
+        if self.inner.read_only {
+            return Err(MutationDispatchError::Errno(libc::EROFS));
+        }
+        if self.should_shed(op) {
+            warn!(
+                ino = ino_for_logging,
+                ?op,
+                "backpressure: shedding mutation request"
+            );
+            return Err(MutationDispatchError::Errno(libc::EBUSY));
+        }
+        Ok(())
+    }
+
+    fn dispatch_mkdir(
+        &self,
+        parent: u64,
+        name: &OsStr,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> Result<InodeAttr, MutationDispatchError> {
+        self.enforce_mutation_guards(RequestOp::Mkdir, parent)?;
+        let cx = Self::cx_for_request();
+        self.with_request_scope(&cx, RequestOp::Mkdir, |cx| {
+            self.inner
+                .ops
+                .mkdir(cx, InodeNumber(parent), name, mode, uid, gid)
+        })
+        .map_err(|error| MutationDispatchError::Operation {
+            error,
+            offset: None,
+        })
+    }
+
+    fn dispatch_rmdir(&self, parent: u64, name: &OsStr) -> Result<(), MutationDispatchError> {
+        self.enforce_mutation_guards(RequestOp::Rmdir, parent)?;
+        let cx = Self::cx_for_request();
+        self.with_request_scope(&cx, RequestOp::Rmdir, |cx| {
+            self.inner.ops.rmdir(cx, InodeNumber(parent), name)
+        })
+        .map_err(|error| MutationDispatchError::Operation {
+            error,
+            offset: None,
+        })
+    }
+
+    fn dispatch_rename(
+        &self,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+    ) -> Result<(), MutationDispatchError> {
+        self.enforce_mutation_guards(RequestOp::Rename, parent)?;
+        let cx = Self::cx_for_request();
+        self.with_request_scope(&cx, RequestOp::Rename, |cx| {
+            self.inner.ops.rename(
+                cx,
+                InodeNumber(parent),
+                name,
+                InodeNumber(newparent),
+                newname,
+            )
+        })
+        .map_err(|error| MutationDispatchError::Operation {
+            error,
+            offset: None,
+        })
+    }
+
+    fn dispatch_write(
+        &self,
+        ino: u64,
+        offset: i64,
+        data: &[u8],
+    ) -> Result<u32, MutationDispatchError> {
+        self.enforce_mutation_guards(RequestOp::Write, ino)?;
+        let byte_offset =
+            u64::try_from(offset).map_err(|_| MutationDispatchError::Errno(libc::EINVAL))?;
+        let cx = Self::cx_for_request();
+        self.with_request_scope(&cx, RequestOp::Write, |cx| {
+            self.inner
+                .ops
+                .write(cx, InodeNumber(ino), byte_offset, data)
+        })
+        .map_err(|error| MutationDispatchError::Operation {
+            error,
+            offset: Some(byte_offset),
+        })
     }
 
     fn read_with_readahead(
@@ -1274,34 +1380,16 @@ impl Filesystem for FrankenFuse {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        if self.inner.read_only {
-            reply.error(libc::EROFS);
-            return;
-        }
-        if self.should_shed(RequestOp::Mkdir) {
-            warn!(parent, "backpressure: shedding mkdir");
-            reply.error(libc::EBUSY);
-            return;
-        }
-        let cx = Self::cx_for_request();
-        match self.with_request_scope(&cx, RequestOp::Mkdir, |cx| {
-            self.inner.ops.mkdir(
-                cx,
-                InodeNumber(parent),
-                name,
-                mode as u16,
-                req.uid(),
-                req.gid(),
-            )
-        }) {
+        match self.dispatch_mkdir(parent, name, mode as u16, req.uid(), req.gid()) {
             Ok(attr) => reply.entry(&ATTR_TTL, &to_file_attr(&attr), 0),
-            Err(e) => {
+            Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
+            Err(MutationDispatchError::Operation { error, offset }) => {
                 Self::reply_error_entry(
                     &FuseErrorContext {
-                        error: &e,
+                        error: &error,
                         operation: "mkdir",
                         ino: parent,
-                        offset: None,
+                        offset,
                     },
                     reply,
                 );
@@ -1339,27 +1427,16 @@ impl Filesystem for FrankenFuse {
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        if self.inner.read_only {
-            reply.error(libc::EROFS);
-            return;
-        }
-        if self.should_shed(RequestOp::Rmdir) {
-            warn!(parent, "backpressure: shedding rmdir");
-            reply.error(libc::EBUSY);
-            return;
-        }
-        let cx = Self::cx_for_request();
-        match self.with_request_scope(&cx, RequestOp::Rmdir, |cx| {
-            self.inner.ops.rmdir(cx, InodeNumber(parent), name)
-        }) {
+        match self.dispatch_rmdir(parent, name) {
             Ok(()) => reply.ok(),
-            Err(e) => {
+            Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
+            Err(MutationDispatchError::Operation { error, offset }) => {
                 Self::reply_error_empty(
                     &FuseErrorContext {
-                        error: &e,
+                        error: &error,
                         operation: "rmdir",
                         ino: parent,
-                        offset: None,
+                        offset,
                     },
                     reply,
                 );
@@ -1377,33 +1454,16 @@ impl Filesystem for FrankenFuse {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
-        if self.inner.read_only {
-            reply.error(libc::EROFS);
-            return;
-        }
-        if self.should_shed(RequestOp::Rename) {
-            warn!(parent, "backpressure: shedding rename");
-            reply.error(libc::EBUSY);
-            return;
-        }
-        let cx = Self::cx_for_request();
-        match self.with_request_scope(&cx, RequestOp::Rename, |cx| {
-            self.inner.ops.rename(
-                cx,
-                InodeNumber(parent),
-                name,
-                InodeNumber(newparent),
-                newname,
-            )
-        }) {
+        match self.dispatch_rename(parent, name, newparent, newname) {
             Ok(()) => reply.ok(),
-            Err(e) => {
+            Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
+            Err(MutationDispatchError::Operation { error, offset }) => {
                 Self::reply_error_empty(
                     &FuseErrorContext {
-                        error: &e,
+                        error: &error,
                         operation: "rename",
                         ino: parent,
-                        offset: None,
+                        offset,
                     },
                     reply,
                 );
@@ -1461,34 +1521,16 @@ impl Filesystem for FrankenFuse {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        if self.inner.read_only {
-            reply.error(libc::EROFS);
-            return;
-        }
-        if self.should_shed(RequestOp::Write) {
-            warn!(ino, "backpressure: shedding write");
-            reply.error(libc::EBUSY);
-            return;
-        }
-        let cx = Self::cx_for_request();
-        let Ok(byte_offset) = u64::try_from(offset) else {
-            warn!(ino, offset, "write: negative offset");
-            reply.error(libc::EINVAL);
-            return;
-        };
-        match self.with_request_scope(&cx, RequestOp::Write, |cx| {
-            self.inner
-                .ops
-                .write(cx, InodeNumber(ino), byte_offset, data)
-        }) {
+        match self.dispatch_write(ino, offset, data) {
             Ok(written) => reply.written(written),
-            Err(e) => {
+            Err(MutationDispatchError::Errno(errno)) => reply.error(errno),
+            Err(MutationDispatchError::Operation { error, offset }) => {
                 Self::reply_error_write(
                     &FuseErrorContext {
-                        error: &e,
+                        error: &error,
                         operation: "write",
                         ino,
-                        offset: Some(byte_offset),
+                        offset,
                     },
                     reply,
                 );
@@ -2567,6 +2609,344 @@ mod tests {
                 HookEvent::End(RequestOp::Getattr)
             ]
         );
+    }
+
+    fn test_inode_attr(ino: u64, kind: FfsFileType, perm: u16) -> InodeAttr {
+        InodeAttr {
+            ino: InodeNumber(ino),
+            size: 0,
+            blocks: 0,
+            atime: SystemTime::UNIX_EPOCH,
+            mtime: SystemTime::UNIX_EPOCH,
+            ctime: SystemTime::UNIX_EPOCH,
+            crtime: SystemTime::UNIX_EPOCH,
+            kind,
+            perm,
+            nlink: 1,
+            uid: 1000,
+            gid: 1000,
+            rdev: 0,
+            blksize: 4096,
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum MutationCall {
+        Write {
+            ino: InodeNumber,
+            offset: u64,
+            data: Vec<u8>,
+        },
+        Mkdir {
+            parent: InodeNumber,
+            name: String,
+            mode: u16,
+            uid: u32,
+            gid: u32,
+        },
+        Rmdir {
+            parent: InodeNumber,
+            name: String,
+        },
+        Rename {
+            parent: InodeNumber,
+            name: String,
+            new_parent: InodeNumber,
+            new_name: String,
+        },
+    }
+
+    struct MutationRecordingFs {
+        calls: Arc<Mutex<Vec<MutationCall>>>,
+    }
+
+    impl MutationRecordingFs {
+        fn new(calls: Arc<Mutex<Vec<MutationCall>>>) -> Self {
+            Self { calls }
+        }
+    }
+
+    impl FsOps for MutationRecordingFs {
+        fn getattr(&self, _cx: &Cx, _ino: InodeNumber) -> ffs_error::Result<InodeAttr> {
+            Err(FfsError::NotFound("stub".into()))
+        }
+
+        fn lookup(
+            &self,
+            _cx: &Cx,
+            _parent: InodeNumber,
+            _name: &OsStr,
+        ) -> ffs_error::Result<InodeAttr> {
+            Err(FfsError::NotFound("stub".into()))
+        }
+
+        fn readdir(
+            &self,
+            _cx: &Cx,
+            _ino: InodeNumber,
+            _offset: u64,
+        ) -> ffs_error::Result<Vec<FfsDirEntry>> {
+            Ok(vec![])
+        }
+
+        fn read(
+            &self,
+            _cx: &Cx,
+            _ino: InodeNumber,
+            _offset: u64,
+            _size: u32,
+        ) -> ffs_error::Result<Vec<u8>> {
+            Ok(vec![])
+        }
+
+        fn readlink(&self, _cx: &Cx, _ino: InodeNumber) -> ffs_error::Result<Vec<u8>> {
+            Ok(vec![])
+        }
+
+        fn mkdir(
+            &self,
+            _cx: &Cx,
+            parent: InodeNumber,
+            name: &OsStr,
+            mode: u16,
+            uid: u32,
+            gid: u32,
+        ) -> ffs_error::Result<InodeAttr> {
+            self.calls
+                .lock()
+                .expect("lock mutation calls")
+                .push(MutationCall::Mkdir {
+                    parent,
+                    name: name.to_string_lossy().into_owned(),
+                    mode,
+                    uid,
+                    gid,
+                });
+            Ok(test_inode_attr(101, FfsFileType::Directory, mode))
+        }
+
+        fn rmdir(&self, _cx: &Cx, parent: InodeNumber, name: &OsStr) -> ffs_error::Result<()> {
+            self.calls
+                .lock()
+                .expect("lock mutation calls")
+                .push(MutationCall::Rmdir {
+                    parent,
+                    name: name.to_string_lossy().into_owned(),
+                });
+            Ok(())
+        }
+
+        fn rename(
+            &self,
+            _cx: &Cx,
+            parent: InodeNumber,
+            name: &OsStr,
+            new_parent: InodeNumber,
+            new_name: &OsStr,
+        ) -> ffs_error::Result<()> {
+            self.calls
+                .lock()
+                .expect("lock mutation calls")
+                .push(MutationCall::Rename {
+                    parent,
+                    name: name.to_string_lossy().into_owned(),
+                    new_parent,
+                    new_name: new_name.to_string_lossy().into_owned(),
+                });
+            Ok(())
+        }
+
+        fn write(
+            &self,
+            _cx: &Cx,
+            ino: InodeNumber,
+            offset: u64,
+            data: &[u8],
+        ) -> ffs_error::Result<u32> {
+            self.calls
+                .lock()
+                .expect("lock mutation calls")
+                .push(MutationCall::Write {
+                    ino,
+                    offset,
+                    data: data.to_vec(),
+                });
+            Ok(u32::try_from(data.len()).unwrap_or(u32::MAX))
+        }
+    }
+
+    #[test]
+    fn dispatch_write_routes_to_fsops() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let options = MountOptions {
+            read_only: false,
+            ..MountOptions::default()
+        };
+        let fuse = FrankenFuse::with_options(
+            Box::new(MutationRecordingFs::new(Arc::clone(&calls))),
+            &options,
+        );
+
+        let written = fuse
+            .dispatch_write(42, 4096, b"abc")
+            .expect("dispatch write");
+        assert_eq!(written, 3);
+        assert_eq!(
+            calls.lock().expect("lock calls").as_slice(),
+            &[MutationCall::Write {
+                ino: InodeNumber(42),
+                offset: 4096,
+                data: b"abc".to_vec(),
+            }]
+        );
+    }
+
+    #[test]
+    fn dispatch_mkdir_routes_to_fsops() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let options = MountOptions {
+            read_only: false,
+            ..MountOptions::default()
+        };
+        let fuse = FrankenFuse::with_options(
+            Box::new(MutationRecordingFs::new(Arc::clone(&calls))),
+            &options,
+        );
+
+        let attr = fuse
+            .dispatch_mkdir(2, OsStr::new("logs"), 0o755, 123, 456)
+            .expect("dispatch mkdir");
+        assert_eq!(attr.ino, InodeNumber(101));
+        assert_eq!(attr.kind, FfsFileType::Directory);
+        assert_eq!(attr.perm, 0o755);
+        assert_eq!(
+            calls.lock().expect("lock calls").as_slice(),
+            &[MutationCall::Mkdir {
+                parent: InodeNumber(2),
+                name: "logs".to_owned(),
+                mode: 0o755,
+                uid: 123,
+                gid: 456,
+            }]
+        );
+    }
+
+    #[test]
+    fn dispatch_rmdir_routes_to_fsops() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let options = MountOptions {
+            read_only: false,
+            ..MountOptions::default()
+        };
+        let fuse = FrankenFuse::with_options(
+            Box::new(MutationRecordingFs::new(Arc::clone(&calls))),
+            &options,
+        );
+
+        fuse.dispatch_rmdir(7, OsStr::new("tmp"))
+            .expect("dispatch rmdir");
+        assert_eq!(
+            calls.lock().expect("lock calls").as_slice(),
+            &[MutationCall::Rmdir {
+                parent: InodeNumber(7),
+                name: "tmp".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn dispatch_rename_routes_to_fsops() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let options = MountOptions {
+            read_only: false,
+            ..MountOptions::default()
+        };
+        let fuse = FrankenFuse::with_options(
+            Box::new(MutationRecordingFs::new(Arc::clone(&calls))),
+            &options,
+        );
+
+        fuse.dispatch_rename(8, OsStr::new("old"), 9, OsStr::new("new"))
+            .expect("dispatch rename");
+        assert_eq!(
+            calls.lock().expect("lock calls").as_slice(),
+            &[MutationCall::Rename {
+                parent: InodeNumber(8),
+                name: "old".to_owned(),
+                new_parent: InodeNumber(9),
+                new_name: "new".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn dispatch_write_rejects_negative_offset() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let options = MountOptions {
+            read_only: false,
+            ..MountOptions::default()
+        };
+        let fuse = FrankenFuse::with_options(
+            Box::new(MutationRecordingFs::new(Arc::clone(&calls))),
+            &options,
+        );
+
+        let err = fuse
+            .dispatch_write(99, -1, b"z")
+            .expect_err("negative offset should fail");
+        assert!(matches!(err, MutationDispatchError::Errno(libc::EINVAL)));
+        assert!(calls.lock().expect("lock calls").is_empty());
+    }
+
+    #[test]
+    fn dispatch_mutations_return_erofs_when_read_only() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let fuse = FrankenFuse::new(Box::new(MutationRecordingFs::new(Arc::clone(&calls))));
+
+        assert!(matches!(
+            fuse.dispatch_write(1, 0, b"x"),
+            Err(MutationDispatchError::Errno(libc::EROFS))
+        ));
+        assert!(matches!(
+            fuse.dispatch_mkdir(1, OsStr::new("d"), 0o755, 1, 1),
+            Err(MutationDispatchError::Errno(libc::EROFS))
+        ));
+        assert!(matches!(
+            fuse.dispatch_rmdir(1, OsStr::new("d")),
+            Err(MutationDispatchError::Errno(libc::EROFS))
+        ));
+        assert!(matches!(
+            fuse.dispatch_rename(1, OsStr::new("a"), 2, OsStr::new("b")),
+            Err(MutationDispatchError::Errno(libc::EROFS))
+        ));
+        assert!(calls.lock().expect("lock calls").is_empty());
+    }
+
+    #[test]
+    fn dispatch_write_returns_ebusy_under_emergency_backpressure() {
+        use asupersync::SystemPressure;
+        use ffs_core::DegradationFsm;
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let options = MountOptions {
+            read_only: false,
+            ..MountOptions::default()
+        };
+        let pressure = Arc::new(SystemPressure::with_headroom(0.02));
+        let fsm = Arc::new(DegradationFsm::new(Arc::clone(&pressure), 1));
+        fsm.tick();
+        let gate = BackpressureGate::new(fsm);
+        let fuse = FrankenFuse::with_backpressure(
+            Box::new(MutationRecordingFs::new(Arc::clone(&calls))),
+            &options,
+            gate,
+        );
+
+        let err = fuse
+            .dispatch_write(11, 0, b"abc")
+            .expect_err("write should be shed");
+        assert!(matches!(err, MutationDispatchError::Errno(libc::EBUSY)));
+        assert!(calls.lock().expect("lock calls").is_empty());
     }
 
     #[test]

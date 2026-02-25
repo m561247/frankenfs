@@ -1748,6 +1748,284 @@ mod tests {
         );
     }
 
+    // ── Error-path and boundary hardening tests ────────────────────────
+
+    #[test]
+    fn reserved_blocks_out_of_range_group_returns_empty() {
+        let geo = make_geometry();
+        let groups = make_groups(&geo);
+        // Group 99 is well beyond the 4 groups we created.
+        let reserved = reserved_blocks_in_group(&geo, &groups, GroupNumber(99));
+        assert!(
+            reserved.is_empty(),
+            "out-of-range group should return empty"
+        );
+    }
+
+    #[test]
+    fn reserved_blocks_includes_bitmap_and_inode_table() {
+        let geo = make_geometry();
+        let groups = make_groups(&geo);
+
+        let reserved = reserved_blocks_in_group(&geo, &groups, GroupNumber(0));
+        // Group 0 has block_bitmap at 1, inode_bitmap at 2, inode_table at 3..130.
+        // (2048 inodes * 256 bytes / 4096 block_size = 128 blocks for inode table)
+        assert!(
+            reserved.contains(&1),
+            "block bitmap should be reserved, got: {reserved:?}"
+        );
+        assert!(
+            reserved.contains(&2),
+            "inode bitmap should be reserved, got: {reserved:?}"
+        );
+        assert!(
+            reserved.contains(&3),
+            "first inode table block should be reserved"
+        );
+        assert!(
+            reserved.contains(&130),
+            "last inode table block should be reserved"
+        );
+        assert!(
+            !reserved.contains(&131),
+            "block past inode table should not be reserved"
+        );
+    }
+
+    #[test]
+    fn free_blocks_group_out_of_range_returns_error() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+
+        // Block far beyond total_blocks → group out of range.
+        let result = free_blocks(&cx, &dev, &geo, &mut groups, BlockNumber(1_000_000), 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn free_blocks_persist_cross_boundary_returns_error() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let pctx = make_persist_ctx();
+
+        // Try to free blocks that span across a group boundary.
+        // Group 0 has 8192 blocks (0..8191). Block 8190 + count=5 crosses into group 1.
+        let result = free_blocks_persist(&cx, &dev, &geo, &mut groups, BlockNumber(8190), 5, &pctx);
+        assert!(result.is_err(), "cross-boundary free should fail");
+    }
+
+    #[test]
+    fn alloc_blocks_zero_count_returns_error() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+
+        let result = alloc_blocks(&cx, &dev, &geo, &mut groups, 0, &AllocHint::default());
+        assert!(result.is_err(), "allocating 0 blocks should fail");
+    }
+
+    #[test]
+    fn alloc_blocks_persist_zero_count_returns_error() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let pctx = make_persist_ctx();
+
+        let result = alloc_blocks_persist(
+            &cx,
+            &dev,
+            &geo,
+            &mut groups,
+            0,
+            &AllocHint::default(),
+            &pctx,
+        );
+        assert!(result.is_err(), "allocating 0 blocks (persist) should fail");
+    }
+
+    #[test]
+    fn alloc_blocks_goal_block_in_different_group_falls_back() {
+        // When goal_block maps to a different group than goal_group,
+        // the search start should fall back to 0 within the goal group.
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+
+        let hint = AllocHint {
+            goal_group: Some(GroupNumber(0)),
+            goal_block: Some(BlockNumber(10000)), // This is in group 1
+        };
+
+        let alloc = alloc_blocks(&cx, &dev, &geo, &mut groups, 1, &hint).unwrap();
+        // Should still allocate in group 0 (goal_group), starting from 0.
+        let (group, _) = geo.absolute_to_group_block(alloc.start);
+        assert_eq!(
+            group,
+            GroupNumber(0),
+            "should allocate in goal group even when goal_block is in a different group"
+        );
+    }
+
+    #[test]
+    fn alloc_blocks_no_hint_uses_group_0() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+
+        let alloc = alloc_blocks(&cx, &dev, &geo, &mut groups, 1, &AllocHint::default()).unwrap();
+
+        let (group, _) = geo.absolute_to_group_block(alloc.start);
+        assert_eq!(group, GroupNumber(0), "no hint should default to group 0");
+    }
+
+    #[test]
+    fn free_inode_zero_returns_error() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+
+        let result = free_inode(&cx, &dev, &geo, &mut groups, InodeNumber(0));
+        assert!(result.is_err(), "freeing inode 0 should fail");
+    }
+
+    #[test]
+    fn free_inode_out_of_range_returns_error() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+
+        let result = free_inode(&cx, &dev, &geo, &mut groups, InodeNumber(100_000));
+        assert!(result.is_err(), "freeing out-of-range inode should fail");
+    }
+
+    #[test]
+    fn free_inode_double_free_returns_error() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+
+        // Allocate then free twice.
+        let alloc = alloc_inode(&cx, &dev, &geo, &mut groups, GroupNumber(0), false).unwrap();
+        free_inode(&cx, &dev, &geo, &mut groups, alloc.ino).unwrap();
+        let result = free_inode(&cx, &dev, &geo, &mut groups, alloc.ino);
+        assert!(
+            result.is_err(),
+            "double-freeing an inode should return error"
+        );
+    }
+
+    #[test]
+    fn bitmap_find_free_start_at_count_wraps_to_zero() {
+        // When start == count, the forward search is empty.
+        // The backward search 0..start should find a free bit.
+        let mut bm = vec![0u8; 4];
+        let count = 32;
+        // Fill bits 0..15, leave 16..31 free.
+        for i in 0..16 {
+            bitmap_set(&mut bm, i);
+        }
+        // start=count=32 → forward loop is empty, wrap-around finds bit 16.
+        let result = bitmap_find_free(&bm, count, count);
+        assert_eq!(result, Some(16), "should wrap around and find bit 16");
+    }
+
+    #[test]
+    fn bitmap_find_free_start_beyond_count_returns_wrap_result() {
+        let bm = vec![0u8; 4]; // all free
+        // start > count → forward loop is empty, wraps to find 0.
+        let result = bitmap_find_free(&bm, 32, 100);
+        assert_eq!(result, Some(0), "start > count should wrap to bit 0");
+    }
+
+    #[test]
+    fn bitmap_find_contiguous_n_zero_returns_zero() {
+        let bm = vec![0xFF; 4]; // all set
+        let result = bitmap_find_contiguous(&bm, 32, 0, 0);
+        assert_eq!(result, Some(0), "finding 0 contiguous bits always succeeds");
+    }
+
+    #[test]
+    fn bitmap_count_free_zero_count_returns_zero() {
+        let bm = vec![0u8; 4]; // all free
+        assert_eq!(bitmap_count_free(&bm, 0), 0, "count=0 should return 0");
+    }
+
+    #[test]
+    fn geometry_blocks_in_last_group_shorter() {
+        // When total_blocks is not evenly divisible by blocks_per_group,
+        // the last group should be shorter.
+        let geo = FsGeometry {
+            blocks_per_group: 8192,
+            inodes_per_group: 2048,
+            block_size: 4096,
+            total_blocks: 30000, // not evenly divisible: 3 full groups + partial
+            total_inodes: 8192,
+            first_data_block: 0,
+            group_count: 4,
+            inode_size: 256,
+        };
+
+        assert_eq!(geo.blocks_in_group(GroupNumber(0)), 8192);
+        assert_eq!(geo.blocks_in_group(GroupNumber(1)), 8192);
+        assert_eq!(geo.blocks_in_group(GroupNumber(2)), 8192);
+        // Last group: 30000 - 3*8192 = 5424.
+        assert_eq!(geo.blocks_in_group(GroupNumber(3)), 5424);
+    }
+
+    #[test]
+    fn geometry_absolute_to_group_with_first_data_block() {
+        let geo = FsGeometry {
+            blocks_per_group: 8192,
+            inodes_per_group: 2048,
+            block_size: 4096,
+            total_blocks: 32768,
+            total_inodes: 8192,
+            first_data_block: 1, // ext4 with 1K blocks has first_data_block=1
+            group_count: 4,
+            inode_size: 256,
+        };
+
+        // Block 1 should be in group 0, relative 0.
+        let (g, off) = geo.absolute_to_group_block(BlockNumber(1));
+        assert_eq!(g, GroupNumber(0));
+        assert_eq!(off, 0);
+
+        // Block 8193 should be in group 1, relative 0.
+        let (g, off) = geo.absolute_to_group_block(BlockNumber(8193));
+        assert_eq!(g, GroupNumber(1));
+        assert_eq!(off, 0);
+    }
+
+    #[test]
+    fn orlov_all_groups_exhausted_returns_nospace() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+
+        // Exhaust all inodes.
+        for g in &mut groups {
+            g.free_inodes = 0;
+        }
+
+        let result = alloc_inode(&cx, &dev, &geo, &mut groups, GroupNumber(0), true);
+        assert!(
+            result.is_err(),
+            "all groups exhausted should return NoSpace"
+        );
+    }
+
     // ── Property-based tests (proptest) ────────────────────────────────
 
     use proptest::prelude::*;

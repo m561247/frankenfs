@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
 
+const FEATURE_PARITY_MARKDOWN: &str = include_str!("../../../FEATURE_PARITY.md");
+const COVERAGE_SUMMARY_HEADING: &str = "Coverage Summary";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoverageDomain {
     pub domain: String,
@@ -32,13 +35,11 @@ pub struct ParityReport {
 impl ParityReport {
     #[must_use]
     pub fn current() -> Self {
-        let domains = vec![
-            CoverageDomain::new("ext4 metadata parsing", 19, 19),
-            CoverageDomain::new("btrfs metadata parsing", 20, 20),
-            CoverageDomain::new("MVCC/COW core", 14, 14),
-            CoverageDomain::new("FUSE surface", 12, 12),
-            CoverageDomain::new("self-healing durability policy", 10, 10),
-        ];
+        let domains = coverage_domains_from_feature_parity(FEATURE_PARITY_MARKDOWN);
+        assert!(
+            !domains.is_empty(),
+            "FEATURE_PARITY.md must include parseable coverage rows",
+        );
 
         let overall_implemented = domains.iter().map(|d| d.implemented).sum();
         let overall_total = domains.iter().map(|d| d.total).sum();
@@ -72,6 +73,55 @@ pub fn percentage(implemented: u32, total: u32) -> f64 {
     } else {
         (f64::from(implemented) / f64::from(total)) * 100.0
     }
+}
+
+fn strip_markdown_emphasis(value: &str) -> &str {
+    value.trim().trim_matches('*')
+}
+
+fn parse_coverage_domain_row(line: &str) -> Option<CoverageDomain> {
+    let cols: Vec<&str> = line.split('|').map(str::trim).collect();
+    if cols.len() < 5 {
+        return None;
+    }
+
+    let domain = strip_markdown_emphasis(cols[1]);
+    if domain.is_empty()
+        || domain.eq_ignore_ascii_case("domain")
+        || domain.eq_ignore_ascii_case("overall")
+    {
+        return None;
+    }
+
+    let implemented: u32 = strip_markdown_emphasis(cols[2]).parse().ok()?;
+    let total: u32 = strip_markdown_emphasis(cols[3]).parse().ok()?;
+    Some(CoverageDomain::new(domain, implemented, total))
+}
+
+fn coverage_domains_from_feature_parity(markdown: &str) -> Vec<CoverageDomain> {
+    let mut domains = Vec::new();
+    let mut in_coverage_summary = false;
+
+    for line in markdown.lines() {
+        let trimmed = line.trim();
+
+        if !in_coverage_summary {
+            if trimmed.starts_with("## ") && trimmed.contains(COVERAGE_SUMMARY_HEADING) {
+                in_coverage_summary = true;
+            }
+            continue;
+        }
+
+        if trimmed.starts_with("## ") {
+            break;
+        }
+
+        if let Some(domain) = parse_coverage_domain_row(trimmed) {
+            domains.push(domain);
+        }
+    }
+
+    domains
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -502,30 +552,6 @@ mod tests {
         assert!(report.overall_coverage_percent > 0.0);
     }
 
-    /// Parse a FEATURE_PARITY.md markdown table row into (domain, implemented, total).
-    fn parse_parity_row(line: &str) -> Option<(String, u32, u32)> {
-        let cols: Vec<&str> = line.split('|').map(str::trim).collect();
-        if cols.len() < 5 {
-            return None;
-        }
-        let domain = cols[1].trim_start_matches("**").trim_end_matches("**");
-        // Skip the "Overall" row — we check it separately
-        if domain.eq_ignore_ascii_case("overall") {
-            return None;
-        }
-        let implemented: u32 = cols[2]
-            .trim_start_matches("**")
-            .trim_end_matches("**")
-            .parse()
-            .ok()?;
-        let total: u32 = cols[3]
-            .trim_start_matches("**")
-            .trim_end_matches("**")
-            .parse()
-            .ok()?;
-        Some((domain.to_lowercase(), implemented, total))
-    }
-
     // ── Fixture generation tests ──────────────────────────────────────
 
     #[test]
@@ -608,13 +634,18 @@ mod tests {
         let md_path = workspace_root.join("FEATURE_PARITY.md");
         let md_text = fs::read_to_string(&md_path).expect("read FEATURE_PARITY.md");
 
-        // Parse all data rows from the Coverage Summary table
-        let mut md_domains: Vec<(String, u32, u32)> = Vec::new();
-        for line in md_text.lines() {
-            if let Some(row) = parse_parity_row(line) {
-                md_domains.push(row);
-            }
-        }
+        // Parse all data rows from the Coverage Summary table using the
+        // same parser as ParityReport::current().
+        let md_domains: Vec<(String, u32, u32)> = coverage_domains_from_feature_parity(&md_text)
+            .into_iter()
+            .map(|domain| {
+                (
+                    domain.domain.to_lowercase(),
+                    domain.implemented,
+                    domain.total,
+                )
+            })
+            .collect();
         assert!(
             !md_domains.is_empty(),
             "FEATURE_PARITY.md should have parseable coverage rows"
@@ -642,5 +673,30 @@ mod tests {
                 domain.total, domain.domain,
             );
         }
+    }
+
+    #[test]
+    fn parity_parser_ignores_non_summary_tables() {
+        let markdown = r"
+# FEATURE_PARITY
+
+## 1. Coverage Summary (Current)
+
+| Domain | Implemented | Total Tracked | Coverage |
+|--------|-------------|---------------|----------|
+| ext4 metadata parsing | 19 | 19 | 100.0% |
+| **Overall** | **19** | **19** | **100.0%** |
+
+## 2. Tracked Capability Matrix
+
+| Capability | Legacy Reference | Status | Notes |
+|------------|------------------|--------|-------|
+| fake row with numeric note | 1 | ✅ | 999 |
+";
+        let domains = coverage_domains_from_feature_parity(markdown);
+        assert_eq!(domains.len(), 1);
+        assert_eq!(domains[0].domain, "ext4 metadata parsing");
+        assert_eq!(domains[0].implemented, 19);
+        assert_eq!(domains[0].total, 19);
     }
 }

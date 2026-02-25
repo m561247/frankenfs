@@ -6742,24 +6742,19 @@ mod tests {
             );
         }
 
-        /// DirtyTracker oldest_dirty_age_ticks is monotonic — each new mark
-        /// does not decrease the age of the oldest entry.
+        /// DirtyTracker oldest age matches a simple sequence-number model.
+        ///
+        /// Re-marking the current oldest block can legitimately decrease age
+        /// because that block is moved to the newest position.
         #[test]
-        fn proptest_dirty_tracker_oldest_age_monotonic(
-            blocks in proptest::collection::vec(0_u64..64, 2..16),
+        fn proptest_dirty_tracker_oldest_age_matches_sequence_model(
+            blocks in proptest::collection::vec(0_u64..64, 1..32),
         ) {
             let mut tracker = DirtyTracker::default();
-            // Mark first block
-            tracker.mark_dirty(
-                BlockNumber(blocks[0]),
-                8,
-                TxnId(0),
-                None,
-                DirtyState::Committed,
-            );
-            let mut prev_age = tracker.oldest_dirty_age_ticks().unwrap_or(0);
-            // Mark subsequent blocks; age of oldest should increase or stay same
-            for &block in &blocks[1..] {
+            let mut model_next_seq = 0_u64;
+            let mut model_by_block: HashMap<u64, u64> = HashMap::new();
+
+            for &block in &blocks {
                 tracker.mark_dirty(
                     BlockNumber(block),
                     8,
@@ -6767,13 +6762,20 @@ mod tests {
                     None,
                     DirtyState::Committed,
                 );
-                let age = tracker.oldest_dirty_age_ticks().unwrap_or(0);
-                prop_assert!(
-                    age >= prev_age,
-                    "oldest age decreased from {} to {} after marking block {}",
-                    prev_age, age, block,
+
+                model_by_block.insert(block, model_next_seq);
+                model_next_seq = model_next_seq.saturating_add(1);
+
+                let expected = model_by_block
+                    .values()
+                    .min()
+                    .map(|oldest_seq| model_next_seq.saturating_sub(*oldest_seq));
+                prop_assert_eq!(
+                    tracker.oldest_dirty_age_ticks(),
+                    expected,
+                    "oldest age mismatch after marking block {}",
+                    block,
                 );
-                prev_age = age;
             }
         }
 
@@ -6862,8 +6864,8 @@ mod tests {
                     .expect("stage");
             }
 
+            let taken = state.take_staged_txn(txn_id);
             if abort {
-                let taken = state.take_staged_txn(txn_id);
                 // Taken set should contain all unique blocks staged
                 let unique_blocks: std::collections::BTreeSet<_> = blocks.iter().copied().collect();
                 prop_assert_eq!(taken.len(), unique_blocks.len());
@@ -6871,8 +6873,7 @@ mod tests {
                 let taken2 = state.take_staged_txn(txn_id);
                 prop_assert!(taken2.is_empty());
             } else {
-                // Commit path: take + insert into resident + mark dirty
-                let taken = state.take_staged_txn(txn_id);
+                // Commit path: insert into resident + mark dirty
                 for (block, data) in &taken {
                     state.on_miss_or_ghost_hit(*block);
                     state.resident.insert(*block, BlockBuf::new(data.clone()));

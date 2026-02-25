@@ -16,7 +16,7 @@ use asupersync::Cx;
 use ffs_core::{Ext4JournalReplayMode, OpenFs, OpenOptions};
 use ffs_fuse::{MountOptions, mount_background};
 use std::fs;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::Command;
@@ -401,6 +401,30 @@ fn fuse_write_overwrite_and_append() {
 
 #[test]
 #[ignore = "requires /dev/fuse"]
+fn fuse_write_with_offset_extends_file_and_zero_fills_gap() {
+    with_rw_mount(|mnt| {
+        let path = mnt.join("offset_write.bin");
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&path)
+            .expect("create offset_write.bin");
+
+        file.seek(SeekFrom::Start(8))
+            .expect("seek to sparse offset");
+        file.write_all(b"abc").expect("write payload at offset");
+        drop(file);
+
+        let bytes = fs::read(&path).expect("read sparse write result");
+        assert_eq!(bytes.len(), 11);
+        assert_eq!(&bytes[..8], vec![0_u8; 8].as_slice());
+        assert_eq!(&bytes[8..], b"abc");
+    });
+}
+
+#[test]
+#[ignore = "requires /dev/fuse"]
 fn fuse_mkdir_and_nested_create() {
     with_rw_mount(|mnt| {
         let dir = mnt.join("newdir");
@@ -420,6 +444,18 @@ fn fuse_mkdir_and_nested_create() {
 
 #[test]
 #[ignore = "requires /dev/fuse"]
+fn fuse_mkdir_existing_directory_fails() {
+    with_rw_mount(|mnt| {
+        let dir = mnt.join("already_there");
+        fs::create_dir(&dir).expect("initial mkdir should succeed");
+
+        let err = fs::create_dir(&dir).expect_err("mkdir existing should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    });
+}
+
+#[test]
+#[ignore = "requires /dev/fuse"]
 fn fuse_unlink_removes_file() {
     with_rw_mount(|mnt| {
         // hello.txt exists from create_test_image.
@@ -428,6 +464,16 @@ fn fuse_unlink_removes_file() {
 
         fs::remove_file(&path).expect("unlink hello.txt via FUSE");
         assert!(!path.exists(), "hello.txt should be gone after unlink");
+    });
+}
+
+#[test]
+#[ignore = "requires /dev/fuse"]
+fn fuse_rmdir_missing_directory_fails() {
+    with_rw_mount(|mnt| {
+        let missing = mnt.join("no_such_dir");
+        let err = fs::remove_dir(&missing).expect_err("rmdir missing should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     });
 }
 
@@ -457,6 +503,24 @@ fn fuse_rmdir_non_empty_fails() {
         assert!(
             dir.exists(),
             "directory should still exist after failed rmdir"
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires /dev/fuse"]
+fn fuse_rename_over_existing_destination_replaces_target() {
+    with_rw_mount(|mnt| {
+        let src = mnt.join("src.txt");
+        let dst = mnt.join("dst.txt");
+        fs::write(&src, b"from-src").expect("write src");
+        fs::write(&dst, b"stale-dst").expect("write existing dst");
+
+        fs::rename(&src, &dst).expect("rename over existing destination");
+        assert!(!src.exists(), "source path should be removed");
+        assert_eq!(
+            fs::read_to_string(&dst).expect("read replaced dst"),
+            "from-src"
         );
     });
 }

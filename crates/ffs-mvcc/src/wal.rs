@@ -625,6 +625,81 @@ mod tests {
         assert_eq!(decoded, commits);
     }
 
+    #[test]
+    fn decode_commit_with_one_byte_returns_need_more() {
+        let result = decode_commit(&[0x01]);
+        match result {
+            DecodeResult::NeedMore(4) => {}
+            other => panic!("expected NeedMore(4), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_commit_with_two_bytes_returns_need_more() {
+        let result = decode_commit(&[0x01, 0x00]);
+        match result {
+            DecodeResult::NeedMore(4) => {}
+            other => panic!("expected NeedMore(4), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_commit_with_three_bytes_returns_need_more() {
+        let result = decode_commit(&[0x01, 0x00, 0x00]);
+        match result {
+            DecodeResult::NeedMore(4) => {}
+            other => panic!("expected NeedMore(4), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn header_rejects_bad_checksum_type() {
+        let mut buf = encode_header(&WalHeader::default());
+        // checksum_type is at offset 6..8 — set to non-zero
+        buf[6] = 0x01;
+        buf[7] = 0x00;
+        let result = decode_header(&buf);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("checksum type"),
+            "error should mention checksum type: {msg}"
+        );
+    }
+
+    #[test]
+    fn header_rejects_too_short_input() {
+        let result = decode_header(&[0_u8; 8]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn commit_byte_size_with_short_input_returns_none() {
+        assert_eq!(commit_byte_size(&[]), None);
+        assert_eq!(commit_byte_size(&[0x01]), None);
+        assert_eq!(commit_byte_size(&[0x01, 0x02, 0x03]), None);
+    }
+
+    #[test]
+    fn commit_byte_size_with_zero_record_len_returns_none() {
+        assert_eq!(commit_byte_size(&[0, 0, 0, 0]), None);
+    }
+
+    #[test]
+    fn decode_commit_with_too_small_record_len_returns_corrupted() {
+        // A record_len of 1 is far too small (min body is 25 bytes = type + seq + txn + nwrites + crc).
+        let mut buf = [0_u8; 8];
+        buf[0..4].copy_from_slice(&1_u32.to_le_bytes()); // record_len = 1
+        buf[4] = 0xFF; // junk
+        let result = decode_commit(&buf);
+        match result {
+            DecodeResult::Corrupted(msg) => {
+                assert!(msg.contains("too small"), "expected 'too small' in: {msg}");
+            }
+            other => panic!("expected Corrupted, got {other:?}"),
+        }
+    }
+
     // ── Property-based tests (proptest) ────────────────────────────────────
 
     use proptest::prelude::*;

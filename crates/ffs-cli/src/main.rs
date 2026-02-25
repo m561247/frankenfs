@@ -6142,7 +6142,7 @@ mod tests {
     };
     use clap::Parser;
     use serde_json::Value;
-    use std::io::{self, Write};
+    use std::io::{self, Seek, SeekFrom, Write};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -6274,6 +6274,34 @@ mod tests {
         }
     }
 
+    fn write_sparse_test_image(path: &std::path::Path, image: &[u8]) -> io::Result<()> {
+        let mut file = std::fs::File::create(path)?;
+        file.set_len(u64::try_from(image.len()).expect("test image length should fit into u64"))?;
+
+        let mut run_start: Option<usize> = None;
+        for (idx, byte) in image.iter().enumerate() {
+            if *byte == 0 {
+                if let Some(start) = run_start.take() {
+                    file.seek(SeekFrom::Start(
+                        u64::try_from(start).expect("run start should fit into u64"),
+                    ))?;
+                    file.write_all(&image[start..idx])?;
+                }
+            } else if run_start.is_none() {
+                run_start = Some(idx);
+            }
+        }
+
+        if let Some(start) = run_start {
+            file.seek(SeekFrom::Start(
+                u64::try_from(start).expect("run start should fit into u64"),
+            ))?;
+            file.write_all(&image[start..])?;
+        }
+
+        file.sync_all()
+    }
+
     fn with_temp_image_path<T>(image: &[u8], f: impl FnOnce(PathBuf) -> T) -> T {
         let mut path = std::env::temp_dir();
         let ts = SystemTime::now()
@@ -6284,7 +6312,7 @@ mod tests {
             "ffs-cli-fsck-force-{}-{ts}.img",
             std::process::id()
         ));
-        std::fs::write(&path, image).expect("write test filesystem image");
+        write_sparse_test_image(&path, image).expect("write test filesystem image");
         let result = f(path.clone());
         let _ = std::fs::remove_file(path);
         result

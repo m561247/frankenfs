@@ -653,6 +653,77 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rcu_cell_update_arc_publishes_value() {
+        let cell = RcuCell::new(10_u64);
+        cell.update_arc(Arc::new(42));
+        assert_eq!(**cell.load(), 42);
+        assert_eq!(cell.update_count(), 1);
+    }
+
+    #[test]
+    fn rcu_cell_load_arc_returns_independent_arc() {
+        let cell = RcuCell::new(99_u32);
+        let arc1 = cell.load_arc();
+        let arc2 = cell.load_arc();
+        assert_eq!(*arc1, 99);
+        assert_eq!(*arc2, 99);
+        // update doesn't affect already-loaded arcs
+        cell.update(200);
+        assert_eq!(*arc1, 99);
+        assert_eq!(**cell.load(), 200);
+    }
+
+    #[test]
+    fn rcu_map_with_churn_threshold_sets_threshold() {
+        let map: RcuMap<u64, u64> = RcuMap::with_churn_threshold(5);
+        // Insert 5 entries — should hit the churn threshold
+        for i in 0..5 {
+            map.insert(i, i * 10);
+        }
+        assert_eq!(map.update_count(), 5);
+        assert_eq!(map.len(), 5);
+    }
+
+    #[test]
+    fn rcu_map_default_is_empty() {
+        let map: RcuMap<u64, u64> = RcuMap::default();
+        assert!(map.is_empty());
+        assert_eq!(map.len(), 0);
+        assert_eq!(map.update_count(), 0);
+    }
+
+    #[test]
+    fn atomic_watermark_with_value_constructor() {
+        let wm = AtomicWatermark::with_value(42);
+        assert_eq!(wm.load(), Some(42));
+        assert_eq!(wm.load_raw(), 42);
+    }
+
+    #[test]
+    fn atomic_watermark_max_sentinel_reads_as_none() {
+        let wm = AtomicWatermark::new();
+        assert_eq!(wm.load(), None);
+        assert_eq!(wm.load_raw(), u64::MAX);
+    }
+
+    #[test]
+    fn rcu_cell_debug_format() {
+        let cell = RcuCell::new(42_u64);
+        let debug_str = format!("{cell:?}");
+        assert!(debug_str.contains("RcuCell"));
+        assert!(debug_str.contains("42"));
+    }
+
+    #[test]
+    fn rcu_map_debug_format() {
+        let map: RcuMap<u64, u64> = RcuMap::new();
+        map.insert(1, 10);
+        let debug_str = format!("{map:?}");
+        assert!(debug_str.contains("RcuMap"));
+        assert!(debug_str.contains("entry_count"));
+    }
+
     // ── Property-based tests (proptest) ────────────────────────────────────
 
     use proptest::prelude::*;

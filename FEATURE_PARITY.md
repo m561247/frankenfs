@@ -13,10 +13,10 @@
 | self-healing durability policy | 10 | 10 | 100.0% |
 | **Overall** | **75** | **75** | **100.0%** |
 
-> **Canonical source:** The `ParityReport::current()` function in `ffs-harness` is the
-> authoritative source for implemented/total counts. This table MUST match those
-> values at all times. A CI test (`parity_report_matches_feature_parity_md`)
-> enforces this invariant.
+> **Canonical source:** This Coverage Summary table in `FEATURE_PARITY.md` is the
+> single source of truth for implemented/total counts. `ParityReport::current()`
+> in `ffs-harness` parses this file, and a CI test
+> (`parity_report_matches_feature_parity_md`) enforces the mapping.
 
 ## 2. Tracked Capability Matrix
 

@@ -204,6 +204,7 @@ pub fn select_action(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn state_classify_clean_when_no_corruption() {
@@ -333,5 +334,89 @@ mod tests {
         // Just above threshold, override kicks in.
         let above = select_action(RepairState::Clean, SAFETY_POSTERIOR_THRESHOLD + 0.001, true);
         assert!(above.safety_override);
+    }
+
+    fn arb_state() -> impl Strategy<Value = RepairState> {
+        prop_oneof![
+            Just(RepairState::Clean),
+            Just(RepairState::MinorCorruption),
+            Just(RepairState::SevereCorruption),
+            Just(RepairState::IoStall),
+        ]
+    }
+
+    proptest! {
+        /// `classify()` always returns IoStall when io_errors is true.
+        #[test]
+        fn proptest_classify_io_errors_always_stall(
+            corrupted in 0_u64..1_000_000,
+            total in 0_u64..1_000_000,
+        ) {
+            prop_assert_eq!(
+                RepairState::classify(corrupted, total, true),
+                RepairState::IoStall
+            );
+        }
+
+        /// `classify()` returns Clean when corrupted_blocks == 0 and no io_errors.
+        #[test]
+        fn proptest_classify_zero_corruption_is_clean(total in 0_u64..1_000_000) {
+            prop_assert_eq!(
+                RepairState::classify(0, total, false),
+                RepairState::Clean
+            );
+        }
+
+        /// `loss()` is always non-negative and finite for all state/action pairs.
+        #[test]
+        fn proptest_loss_nonneg_finite(state in arb_state()) {
+            for action in RepairAction::ALL {
+                let l = loss(state, action);
+                prop_assert!(l >= 0.0, "loss({:?}, {:?}) = {} < 0", state, action, l);
+                prop_assert!(l.is_finite(), "loss({:?}, {:?}) is not finite", state, action);
+            }
+        }
+
+        /// `select_action()` always returns finite loss and a valid action.
+        #[test]
+        fn proptest_select_action_valid(
+            state in arb_state(),
+            posterior in 0.0_f64..1.0,
+            sufficient in any::<bool>(),
+        ) {
+            let decision = select_action(state, posterior, sufficient);
+            prop_assert!(decision.loss.is_finite(), "decision loss not finite");
+            prop_assert!(decision.loss >= 0.0, "decision loss < 0");
+            prop_assert_eq!(decision.state, state);
+        }
+
+        /// Safety override fires iff posterior > SAFETY_POSTERIOR_THRESHOLD.
+        #[test]
+        fn proptest_safety_override_threshold(
+            posterior in 0.0_f64..1.0,
+            sufficient in any::<bool>(),
+        ) {
+            let result = safety_override(posterior, sufficient);
+            if posterior > SAFETY_POSTERIOR_THRESHOLD {
+                prop_assert!(result.is_some(), "should override at posterior={}", posterior);
+            } else {
+                prop_assert!(result.is_none(), "should not override at posterior={}", posterior);
+            }
+        }
+
+        /// DeferRepair loss monotonically increases with severity.
+        #[test]
+        fn proptest_defer_loss_monotonic_with_severity(
+            corrupted in 0_u64..100_000,
+            total in 1_u64..100_000,
+        ) {
+            let corrupted = corrupted.min(total);
+            let state = RepairState::classify(corrupted, total, false);
+            let defer_loss = loss(state, RepairAction::DeferRepair);
+
+            // Clean should have the lowest DeferRepair loss
+            let clean_loss = loss(RepairState::Clean, RepairAction::DeferRepair);
+            prop_assert!(defer_loss >= clean_loss - f64::EPSILON);
+        }
     }
 }

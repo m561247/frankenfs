@@ -384,6 +384,7 @@ impl std::error::Error for RepairParseError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn repair_block_header_round_trip() {
@@ -559,5 +560,166 @@ mod tests {
             &REPAIR_GROUP_DESC_MAGIC.to_le_bytes(),
             b"FRQR", // LE representation of 0x52515246
         );
+    }
+
+    proptest! {
+        /// RepairBlockHeader round-trips through to_bytes/parse for all field values.
+        #[test]
+        fn proptest_repair_block_header_round_trip(
+            first_esi in any::<u32>(),
+            symbol_count in any::<u16>(),
+            symbol_size in any::<u16>(),
+            block_group in any::<u32>(),
+            repair_generation in any::<u64>(),
+        ) {
+            let header = RepairBlockHeader {
+                first_esi,
+                symbol_count,
+                symbol_size,
+                block_group: GroupNumber(block_group),
+                repair_generation,
+                checksum: 0,
+            };
+            let bytes = header.to_bytes();
+            let parsed = RepairBlockHeader::parse(&bytes).expect("parse should succeed");
+            prop_assert_eq!(parsed.first_esi, first_esi);
+            prop_assert_eq!(parsed.symbol_count, symbol_count);
+            prop_assert_eq!(parsed.symbol_size, symbol_size);
+            prop_assert_eq!(parsed.block_group, GroupNumber(block_group));
+            prop_assert_eq!(parsed.repair_generation, repair_generation);
+        }
+
+        /// Any single-bit flip in a RepairBlockHeader is detected by CRC32C.
+        #[test]
+        fn proptest_repair_block_header_bit_flip_detected(
+            first_esi in any::<u32>(),
+            symbol_count in any::<u16>(),
+            symbol_size in any::<u16>(),
+            block_group in any::<u32>(),
+            repair_generation in any::<u64>(),
+            flip_byte in 0_usize..28, // any byte in the non-reserved region
+            flip_bit in 0_u8..8,
+        ) {
+            let header = RepairBlockHeader {
+                first_esi,
+                symbol_count,
+                symbol_size,
+                block_group: GroupNumber(block_group),
+                repair_generation,
+                checksum: 0,
+            };
+            let mut bytes = header.to_bytes();
+            bytes[flip_byte] ^= 1 << flip_bit;
+            let result = RepairBlockHeader::parse(&bytes);
+            // Must detect corruption (either bad magic or checksum mismatch)
+            prop_assert!(result.is_err(), "bit flip at byte {} bit {} not detected", flip_byte, flip_bit);
+        }
+
+        /// RepairGroupDescExt round-trips through to_bytes/parse for all field values.
+        #[test]
+        fn proptest_repair_group_desc_ext_round_trip(
+            transfer_length in any::<u64>(),
+            symbol_size in any::<u16>(),
+            source_block_count in any::<u16>(),
+            sub_blocks in any::<u16>(),
+            symbol_alignment in any::<u16>(),
+            repair_start_block in any::<u64>(),
+            repair_block_count in any::<u32>(),
+            repair_generation in any::<u64>(),
+        ) {
+            let desc = RepairGroupDescExt {
+                transfer_length,
+                symbol_size,
+                source_block_count,
+                sub_blocks,
+                symbol_alignment,
+                repair_start_block: BlockNumber(repair_start_block),
+                repair_block_count,
+                repair_generation,
+                checksum: 0,
+            };
+            let bytes = desc.to_bytes();
+            let parsed = RepairGroupDescExt::parse(&bytes).expect("parse should succeed");
+            prop_assert_eq!(parsed.transfer_length, transfer_length);
+            prop_assert_eq!(parsed.symbol_size, symbol_size);
+            prop_assert_eq!(parsed.source_block_count, source_block_count);
+            prop_assert_eq!(parsed.sub_blocks, sub_blocks);
+            prop_assert_eq!(parsed.symbol_alignment, symbol_alignment);
+            prop_assert_eq!(parsed.repair_start_block, BlockNumber(repair_start_block));
+            prop_assert_eq!(parsed.repair_block_count, repair_block_count);
+            prop_assert_eq!(parsed.repair_generation, repair_generation);
+        }
+
+        /// Any single-bit flip in a RepairGroupDescExt is detected by CRC32C.
+        #[test]
+        fn proptest_repair_group_desc_ext_bit_flip_detected(
+            transfer_length in any::<u64>(),
+            symbol_size in any::<u16>(),
+            source_block_count in any::<u16>(),
+            sub_blocks in any::<u16>(),
+            symbol_alignment in any::<u16>(),
+            repair_start_block in any::<u64>(),
+            repair_block_count in any::<u32>(),
+            repair_generation in any::<u64>(),
+            flip_byte in 0_usize..44, // any byte in the non-reserved region
+            flip_bit in 0_u8..8,
+        ) {
+            let desc = RepairGroupDescExt {
+                transfer_length,
+                symbol_size,
+                source_block_count,
+                sub_blocks,
+                symbol_alignment,
+                repair_start_block: BlockNumber(repair_start_block),
+                repair_block_count,
+                repair_generation,
+                checksum: 0,
+            };
+            let mut bytes = desc.to_bytes();
+            bytes[flip_byte] ^= 1 << flip_bit;
+            let result = RepairGroupDescExt::parse(&bytes);
+            prop_assert!(result.is_err(), "bit flip at byte {} bit {} not detected", flip_byte, flip_bit);
+        }
+
+        /// SymbolDigest round-trips through to_bytes/parse.
+        #[test]
+        fn proptest_symbol_digest_round_trip(
+            esi in any::<u32>(),
+            digest in any::<[u8; 32]>(),
+        ) {
+            let sd = SymbolDigest { esi, digest };
+            let bytes = sd.to_bytes();
+            let parsed = SymbolDigest::parse(&bytes).expect("parse should succeed");
+            prop_assert_eq!(parsed.esi, esi);
+            prop_assert_eq!(parsed.digest, digest);
+        }
+
+        /// `compute_repair_block_count` is monotonically non-decreasing in overhead_ratio.
+        #[test]
+        fn proptest_repair_block_count_monotonic_in_overhead(
+            source_blocks in 1_u32..65536,
+            low_ratio in 1.0_f64..1.5,
+            delta in 0.0_f64..0.5,
+        ) {
+            let high_ratio = low_ratio + delta;
+            let low_count = RepairGroupDescExt::compute_repair_block_count(source_blocks, low_ratio);
+            let high_count = RepairGroupDescExt::compute_repair_block_count(source_blocks, high_ratio);
+            prop_assert!(
+                high_count >= low_count,
+                "repair count not monotonic: ratio {} → {}, ratio {} → {}",
+                low_ratio, low_count, high_ratio, high_count
+            );
+        }
+
+        /// `repair_seed()` is deterministic for same inputs and differs for different groups.
+        #[test]
+        fn proptest_repair_seed_deterministic(
+            uuid in any::<[u8; 16]>(),
+            group in any::<u32>(),
+        ) {
+            let seed1 = repair_seed(&uuid, GroupNumber(group));
+            let seed2 = repair_seed(&uuid, GroupNumber(group));
+            prop_assert_eq!(seed1, seed2, "seed must be deterministic");
+        }
     }
 }

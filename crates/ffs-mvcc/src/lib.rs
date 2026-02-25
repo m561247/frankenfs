@@ -5878,6 +5878,231 @@ mod tests {
         assert_eq!(buf.as_slice(), &[0xAB; 512]);
     }
 
+    #[test]
+    fn abort_with_cow_allocator_frees_blocks() {
+        let cx = test_cx();
+        let mut store = MvccStore::new();
+        let alloc = TestCowAllocator::new(1000);
+
+        // Begin a transaction and do two COW writes.
+        let mut txn = store.begin();
+        store
+            .write_cow(BlockNumber(0), &[0xAA; 64], &mut txn, &alloc, &cx)
+            .expect("cow write 1");
+        store
+            .write_cow(BlockNumber(1), &[0xBB; 64], &mut txn, &alloc, &cx)
+            .expect("cow write 2");
+
+        // Should have allocated 2 blocks.
+        assert_eq!(alloc.allocated_blocks().len(), 2);
+
+        // Abort should defer-free those blocks and GC them.
+        store.abort_with_cow_allocator(txn, TxnAbortReason::UserAbort, None, &alloc, &cx);
+
+        // Blocks should have been freed (deferred at CommitSeq(0), GC'd with
+        // watermark >= 0).
+        assert_eq!(alloc.freed_blocks().len(), 2);
+    }
+
+    #[test]
+    fn abort_with_cow_allocator_frees_orphans() {
+        let cx = test_cx();
+        let mut store = MvccStore::new();
+        let alloc = TestCowAllocator::new(1000);
+
+        // Begin a transaction and write the SAME block twice to produce an orphan.
+        let mut txn = store.begin();
+        store
+            .write_cow(BlockNumber(0), &[0xAA; 64], &mut txn, &alloc, &cx)
+            .expect("cow write 1");
+        let first_physical = alloc.allocated_blocks()[0];
+        store
+            .write_cow(BlockNumber(0), &[0xBB; 64], &mut txn, &alloc, &cx)
+            .expect("cow write 2 (re-write)");
+
+        // Should have allocated 2 blocks (first becomes orphan).
+        assert_eq!(alloc.allocated_blocks().len(), 2);
+
+        // Abort should free both the active block and the orphan.
+        store.abort_with_cow_allocator(txn, TxnAbortReason::UserAbort, None, &alloc, &cx);
+
+        let freed = alloc.freed_blocks();
+        assert!(
+            freed.contains(&first_physical),
+            "first (orphaned) physical block should be freed"
+        );
+        assert_eq!(freed.len(), 2);
+    }
+
+    #[test]
+    fn preflight_commit_fcw_detects_conflict() {
+        let mut store = MvccStore::new();
+        let block = BlockNumber(0);
+
+        // Begin two transactions at the same snapshot.
+        let mut txn_a = store.begin();
+        let mut txn_b = store.begin();
+
+        txn_a.stage_write(block, vec![0xAA; 64]);
+        txn_b.stage_write(block, vec![0xBB; 64]);
+
+        // Commit txn_a.
+        store.commit(txn_a).expect("txn_a commits");
+
+        // Preflight check for txn_b should detect conflict.
+        let result = store.preflight_commit_fcw(&txn_b);
+        assert!(result.is_err(), "preflight should detect conflict");
+    }
+
+    #[test]
+    fn preflight_then_prechecked_commit_succeeds() {
+        let mut store = MvccStore::new();
+        let block = BlockNumber(0);
+
+        let mut txn = store.begin();
+        txn.stage_write(block, vec![0xCC; 64]);
+
+        // Preflight passes with no conflict.
+        store
+            .preflight_commit_fcw(&txn)
+            .expect("preflight should pass");
+
+        // Prechecked commit should succeed.
+        let commit_seq = store.commit_fcw_prechecked(txn);
+        assert!(commit_seq.0 > 0);
+
+        // Data should be visible.
+        let snap = store.current_snapshot();
+        let data = store.read_visible(block, snap).expect("must be visible");
+        assert_eq!(data[0], 0xCC);
+    }
+
+    #[test]
+    fn write_cow_double_write_produces_orphan_on_commit() {
+        let cx = test_cx();
+        let mut store = MvccStore::new();
+        let alloc = TestCowAllocator::new(1000);
+
+        // Commit an initial version so there's something to COW.
+        {
+            let mut txn = store.begin();
+            txn.stage_write(BlockNumber(0), vec![0x01; 64]);
+            store.commit(txn).expect("initial commit");
+        }
+
+        // In a single transaction, write the same block twice via COW.
+        let mut txn = store.begin();
+        store
+            .write_cow(BlockNumber(0), &[0xAA; 64], &mut txn, &alloc, &cx)
+            .expect("cow write 1");
+        let first_alloc = alloc.allocated_blocks()[0];
+        store
+            .write_cow(BlockNumber(0), &[0xBB; 64], &mut txn, &alloc, &cx)
+            .expect("cow write 2");
+        let second_alloc = alloc.allocated_blocks()[1];
+
+        // The first allocation should become an orphan.
+        assert_ne!(first_alloc, second_alloc, "should be different blocks");
+
+        // Commit with cow allocator — the orphan and old physical should be deferred.
+        store
+            .commit_with_cow_allocator(txn, &alloc, &cx)
+            .expect("commit with cow");
+
+        // Data should be the second write value.
+        let snap = store.current_snapshot();
+        let data = store
+            .read_visible(BlockNumber(0), snap)
+            .expect("must be visible");
+        assert_eq!(data[0], 0xBB);
+    }
+
+    #[test]
+    fn registry_watermark_lockfree_tracks_register_release() {
+        let registry = Arc::new(SnapshotRegistry::new());
+
+        // No snapshots: lockfree watermark should be None.
+        assert_eq!(registry.watermark_lockfree(), None);
+
+        let snap1 = Snapshot {
+            high: CommitSeq(10),
+        };
+        let snap2 = Snapshot {
+            high: CommitSeq(20),
+        };
+
+        let _h1 = SnapshotRegistry::acquire(&registry, snap1);
+        assert_eq!(registry.watermark_lockfree(), Some(CommitSeq(10)));
+
+        let _h2 = SnapshotRegistry::acquire(&registry, snap2);
+        assert_eq!(
+            registry.watermark_lockfree(),
+            Some(CommitSeq(10)),
+            "watermark should be min(10, 20) = 10"
+        );
+
+        drop(_h1);
+        assert_eq!(
+            registry.watermark_lockfree(),
+            Some(CommitSeq(20)),
+            "after releasing snap1, watermark should be 20"
+        );
+
+        drop(_h2);
+        assert_eq!(
+            registry.watermark_lockfree(),
+            None,
+            "after releasing all, watermark should be None"
+        );
+    }
+
+    #[test]
+    fn advance_counters_sets_minimum() {
+        let mut store = MvccStore::new();
+
+        // With fresh store, next_commit and next_txn should be small.
+        store.advance_counters(100, 200);
+
+        // Now transactions should use IDs >= 201 and commits >= 101.
+        let txn = store.begin();
+        assert!(
+            txn.id().0 >= 201,
+            "txn id should be >= 201, got {}",
+            txn.id().0
+        );
+    }
+
+    #[test]
+    fn insert_versions_makes_block_visible() {
+        let mut store = MvccStore::new();
+
+        // Advance counters so current_snapshot().high >= our version's commit_seq.
+        store.advance_counters(10, 10);
+
+        // Manually commit something so the store's snapshot moves forward.
+        let mut txn = store.begin();
+        txn.stage_write(BlockNumber(999), vec![0xFF; 8]);
+        store.commit(txn).expect("advance commit");
+
+        // Insert a pre-built version chain for block 42.
+        store.insert_versions(
+            BlockNumber(42),
+            vec![BlockVersion {
+                block: BlockNumber(42),
+                commit_seq: CommitSeq(5),
+                writer: TxnId(1),
+                data: VersionData::Full(vec![0xDE; 64]),
+            }],
+        );
+
+        // Should be visible at the current snapshot (which is > CommitSeq(5)).
+        let snap = store.current_snapshot();
+        let data = store
+            .read_visible(BlockNumber(42), snap)
+            .expect("must be visible");
+        assert_eq!(data[0], 0xDE);
+    }
+
     // ── Property-based tests (proptest) ────────────────────────────────────
 
     use proptest::prelude::*;
