@@ -5877,4 +5877,247 @@ mod tests {
         let buf = dev.read_block(&cx, BlockNumber(1)).expect("read");
         assert_eq!(buf.as_slice(), &[0xAB; 512]);
     }
+
+    // ── Property-based tests (proptest) ────────────────────────────────────
+
+    use proptest::prelude::*;
+
+    /// Strategy: generate a sequence of (block_number, data_byte) write operations.
+    fn write_ops_strategy() -> impl Strategy<Value = Vec<(u16, u8)>> {
+        prop::collection::vec((0_u16..64, any::<u8>()), 1..32)
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Invariant: committed writes are visible to subsequent snapshots.
+        ///
+        /// For any sequence of writes committed in a single transaction,
+        /// a new snapshot taken after commit must see all of them.
+        /// When duplicate block numbers appear, the last write wins.
+        #[test]
+        fn proptest_committed_writes_visible_to_new_snapshots(
+            ops in write_ops_strategy(),
+        ) {
+            let mut store = MvccStore::new();
+
+            // Build expected: last write per block wins (BTreeMap overwrites).
+            let mut expected = std::collections::BTreeMap::<u16, u8>::new();
+            let mut txn = store.begin();
+            for &(block, byte) in &ops {
+                txn.stage_write(BlockNumber(u64::from(block)), vec![byte; 64]);
+                expected.insert(block, byte);
+            }
+            store.commit(txn).expect("commit should succeed");
+
+            // Read from a new snapshot — all committed blocks must be visible
+            // with the last-written value.
+            let snap = store.current_snapshot();
+            for (&block, &byte) in &expected {
+                let data = store
+                    .read_visible(BlockNumber(u64::from(block)), snap)
+                    .expect("committed block must be visible");
+                prop_assert_eq!(data[0], byte, "block {} data mismatch", block);
+            }
+        }
+
+        /// Invariant: snapshot isolation — a snapshot sees only versions committed
+        /// before its creation, not versions committed after.
+        #[test]
+        fn proptest_snapshot_isolation_excludes_later_commits(
+            pre_ops in write_ops_strategy(),
+            post_ops in write_ops_strategy(),
+        ) {
+            let mut store = MvccStore::new();
+
+            // Build expected: last write per block within the transaction wins.
+            let mut pre_expected = std::collections::BTreeMap::<u16, u8>::new();
+            let mut txn1 = store.begin();
+            for &(block, byte) in &pre_ops {
+                txn1.stage_write(BlockNumber(u64::from(block)), vec![byte; 64]);
+                pre_expected.insert(block, byte);
+            }
+            store.commit(txn1).expect("commit pre");
+
+            // Take snapshot.
+            let snap = store.current_snapshot();
+
+            // Commit post-snapshot writes with different data.
+            let mut txn2 = store.begin();
+            for &(block, byte) in &post_ops {
+                txn2.stage_write(BlockNumber(u64::from(block)), vec![byte.wrapping_add(1); 64]);
+            }
+            store.commit(txn2).expect("commit post");
+
+            // The snapshot must still see the pre-commit values, not the post-commit ones.
+            for (&block, &byte) in &pre_expected {
+                if let Some(data) = store.read_visible(BlockNumber(u64::from(block)), snap) {
+                    prop_assert_eq!(
+                        data[0], byte,
+                        "snapshot isolation violated for block {}",
+                        block
+                    );
+                }
+            }
+        }
+
+        /// Invariant: version chain monotonicity — commit sequences in a block's
+        /// version chain are strictly increasing.
+        #[test]
+        fn proptest_version_chain_monotonic(
+            num_commits in 2_usize..16,
+            block_id in 0_u16..32,
+        ) {
+            let mut store = MvccStore::new();
+            let block = BlockNumber(u64::from(block_id));
+
+            let mut committed_seqs = Vec::new();
+            for i in 0..num_commits {
+                let mut txn = store.begin();
+                #[allow(clippy::cast_possible_truncation)]
+                txn.stage_write(block, vec![i as u8; 64]);
+                let seq = store.commit(txn).expect("commit");
+                committed_seqs.push(seq);
+            }
+
+            // All commit sequences must be strictly increasing.
+            for window in committed_seqs.windows(2) {
+                prop_assert!(
+                    window[0] < window[1],
+                    "commit seq not monotonic: {:?} >= {:?}",
+                    window[0],
+                    window[1]
+                );
+            }
+        }
+
+        /// Invariant: FCW conflict detection — when two transactions write to
+        /// the same block, only the first committer succeeds.
+        #[test]
+        fn proptest_fcw_detects_write_write_conflict(
+            block_id in 0_u16..64,
+            byte_a in any::<u8>(),
+            byte_b in any::<u8>(),
+        ) {
+            let mut store = MvccStore::new();
+            let block = BlockNumber(u64::from(block_id));
+
+            // Begin two concurrent transactions at the same snapshot.
+            let mut txn_a = store.begin();
+            let mut txn_b = store.begin();
+
+            txn_a.stage_write(block, vec![byte_a; 64]);
+            txn_b.stage_write(block, vec![byte_b; 64]);
+
+            // First committer wins.
+            store.commit(txn_a).expect("txn_a should commit first");
+
+            // Second committer must fail with a conflict.
+            let result = store.commit(txn_b);
+            prop_assert!(
+                result.is_err(),
+                "FCW should reject txn_b for block {}",
+                block_id,
+            );
+            match result.unwrap_err() {
+                CommitError::Conflict { block: b, .. } => {
+                    prop_assert_eq!(b, block, "conflict block mismatch");
+                }
+                other => {
+                    prop_assert!(false, "expected Conflict, got {:?}", other);
+                }
+            }
+        }
+
+        /// Invariant: non-overlapping writes from concurrent transactions
+        /// both commit successfully.
+        #[test]
+        fn proptest_non_overlapping_concurrent_writes_succeed(
+            block_a in 0_u16..32,
+            block_b in 32_u16..64,
+            byte_a in any::<u8>(),
+            byte_b in any::<u8>(),
+        ) {
+            let mut store = MvccStore::new();
+
+            let mut txn_a = store.begin();
+            let mut txn_b = store.begin();
+
+            txn_a.stage_write(BlockNumber(u64::from(block_a)), vec![byte_a; 64]);
+            txn_b.stage_write(BlockNumber(u64::from(block_b)), vec![byte_b; 64]);
+
+            store.commit(txn_a).expect("disjoint txn_a should commit");
+            store.commit(txn_b).expect("disjoint txn_b should commit");
+
+            // Both writes must be visible.
+            let snap = store.current_snapshot();
+            let va = store
+                .read_visible(BlockNumber(u64::from(block_a)), snap)
+                .expect("block_a visible");
+            let vb = store
+                .read_visible(BlockNumber(u64::from(block_b)), snap)
+                .expect("block_b visible");
+            prop_assert_eq!(va[0], byte_a);
+            prop_assert_eq!(vb[0], byte_b);
+        }
+
+        /// Invariant: last-writer-wins semantics across sequential transactions.
+        ///
+        /// When multiple transactions write to the same block and commit
+        /// sequentially (not concurrently), the latest committed value is
+        /// the one visible to a new snapshot.
+        #[test]
+        fn proptest_sequential_writes_last_value_wins(
+            writes in prop::collection::vec(any::<u8>(), 2..8),
+            block_id in 0_u16..32,
+        ) {
+            let mut store = MvccStore::new();
+            let block = BlockNumber(u64::from(block_id));
+
+            for &byte in &writes {
+                let mut txn = store.begin();
+                txn.stage_write(block, vec![byte; 64]);
+                store.commit(txn).expect("sequential commit");
+            }
+
+            let snap = store.current_snapshot();
+            let version = store.read_visible(block, snap).expect("must be visible");
+            let expected = *writes.last().unwrap();
+            let actual = version[0];
+            prop_assert_eq!(actual, expected, "last writer should win");
+        }
+
+        /// Invariant: reading an unwritten block returns None.
+        #[test]
+        fn proptest_unwritten_block_returns_none(
+            block_id in 0_u64..1024,
+        ) {
+            let store = MvccStore::new();
+            let snap = store.current_snapshot();
+            let result = store.read_visible(BlockNumber(block_id), snap);
+            prop_assert!(result.is_none(), "unwritten block {} should be None", block_id);
+        }
+
+        /// Invariant: abort discards writes — a transaction's writes become
+        /// invisible after abort.
+        #[test]
+        fn proptest_abort_discards_writes(
+            ops in write_ops_strategy(),
+        ) {
+            let mut store = MvccStore::new();
+
+            let mut txn = store.begin();
+            for &(block, byte) in &ops {
+                txn.stage_write(BlockNumber(u64::from(block)), vec![byte; 64]);
+            }
+            store.abort(txn, TxnAbortReason::UserAbort, None);
+
+            // All blocks should be unwritten.
+            let snap = store.current_snapshot();
+            for &(block, _) in &ops {
+                let result = store.read_visible(BlockNumber(u64::from(block)), snap);
+                prop_assert!(result.is_none(), "aborted write to block {} should not be visible", block);
+            }
+        }
+    }
 }

@@ -172,6 +172,12 @@ impl SuccinctBitmap {
         if i == 0 {
             return 0;
         }
+        if i == self.len {
+            // `blocks` stores one entry per logical block start. When `i`
+            // lands exactly on `len` and `len` is block-aligned, `i / BLOCK_BITS`
+            // points one past the final block entry.
+            return self.ones;
+        }
 
         let super_idx = (i / SUPERBLOCK_BITS) as usize;
         let block_idx = (i / BLOCK_BITS) as usize;
@@ -784,5 +790,158 @@ mod tests {
         assert_eq!(sb.select1(1), Some(511));
         assert_eq!(sb.select1(2), Some(512));
         assert_eq!(sb.select1(3), Some(513));
+    }
+
+    #[test]
+    fn rank1_len_on_block_boundary_is_safe() {
+        let mut bitmap = vec![0_u8; 128]; // 1024 bits, exact multiple of 256.
+        for i in [0_u32, 255, 256, 511, 700, 1023] {
+            let byte_idx = usize::try_from(i / 8).expect("test index fits usize");
+            let bit_idx = i % 8;
+            bitmap[byte_idx] |= 1 << bit_idx;
+        }
+
+        let sb = SuccinctBitmap::build(&bitmap, 1024);
+        assert_eq!(sb.count_ones(), 6);
+        assert_eq!(sb.rank1(1024), 6);
+        assert_eq!(sb.rank0(1024), 1018);
+    }
+
+    /// Exhaustive monotonicity check across block and superblock boundaries.
+    #[test]
+    fn rank1_monotonicity_at_boundaries() {
+        let test_lens: Vec<u32> = vec![
+            1, 7, 8, 9, 255, 256, 257, 511, 512, 513, 2047, 2048, 2049, 2303, 2304, 2305, 4096,
+        ];
+
+        for &len in &test_lens {
+            let byte_len = len.div_ceil(8) as usize;
+            for pattern in [0x00_u8, 0xFF, 0x55, 0xAA] {
+                let bm = vec![pattern; byte_len];
+                verify_rank1_monotonic(&bm, len);
+            }
+
+            // Single set bit at boundary positions.
+            for &boundary_bit in &[0_u32, len / 2, len.saturating_sub(1)] {
+                if boundary_bit < len {
+                    let mut bm = vec![0_u8; byte_len];
+                    bm[(boundary_bit / 8) as usize] |= 1 << (boundary_bit % 8);
+                    verify_rank1_monotonic(&bm, len);
+                }
+            }
+        }
+    }
+
+    fn verify_rank1_monotonic(bitmap: &[u8], len: u32) {
+        let sb = SuccinctBitmap::build(bitmap, len);
+        let mut prev = 0_u32;
+        for i in 1..=len {
+            let r = sb.rank1(i);
+            assert!(
+                r >= prev,
+                "rank1({i}) = {r} < rank1({}) = {prev} (len={len})",
+                i - 1
+            );
+            assert!(
+                r <= prev + 1,
+                "rank1 jumped by more than 1 at position {i} (len={len}): {prev} -> {r}",
+            );
+            prev = r;
+        }
+        assert_eq!(
+            sb.rank1(len),
+            sb.count_ones(),
+            "rank1(len) != count_ones for len={len}"
+        );
+    }
+
+    // ── Property-based tests (proptest) ────────────────────────────────
+
+    use proptest::prelude::*;
+
+    /// Strategy: generate an arbitrary bitmap of 1..512 bytes with a valid bit length.
+    fn bitmap_strategy() -> impl Strategy<Value = (Vec<u8>, u32)> {
+        (1_usize..512).prop_flat_map(|byte_len| {
+            let max_bits =
+                u32::try_from(byte_len * 8).expect("byte_len bound keeps bit length within u32");
+            (prop::collection::vec(any::<u8>(), byte_len), 1..=max_bits)
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn proptest_rank1_select1_roundtrip((ref bitmap, len) in bitmap_strategy()) {
+            let sb = SuccinctBitmap::build(bitmap, len);
+            for k in 0..sb.count_ones() {
+                let pos = sb.select1(k);
+                prop_assert!(pos.is_some(), "select1({}) returned None but ones={}", k, sb.count_ones());
+                let pos = pos.unwrap();
+                let rank = sb.rank1(pos);
+                prop_assert_eq!(rank, k, "rank1(select1({})) = {} != {}", k, rank, k);
+            }
+            // Out-of-range select1 should return None.
+            prop_assert!(sb.select1(sb.count_ones()).is_none());
+        }
+
+        #[test]
+        fn proptest_rank0_select0_roundtrip((ref bitmap, len) in bitmap_strategy()) {
+            let sb = SuccinctBitmap::build(bitmap, len);
+            for k in 0..sb.count_zeros() {
+                let pos = sb.select0(k);
+                prop_assert!(pos.is_some(), "select0({}) returned None but zeros={}", k, sb.count_zeros());
+                let pos = pos.unwrap();
+                let rank = sb.rank0(pos);
+                prop_assert_eq!(rank, k, "rank0(select0({})) = {} != {}", k, rank, k);
+            }
+            // Out-of-range select0 should return None.
+            prop_assert!(sb.select0(sb.count_zeros()).is_none());
+        }
+
+        #[test]
+        fn proptest_rank1_monotonic((ref bitmap, len) in bitmap_strategy()) {
+            let sb = SuccinctBitmap::build(bitmap, len);
+            let mut prev = 0_u32;
+            for i in 1..=len {
+                let r = sb.rank1(i);
+                prop_assert!(r >= prev, "rank1({}) = {} < rank1({}) = {}", i, r, i - 1, prev);
+                prop_assert!(r <= prev + 1, "rank1 jumped by more than 1 at position {}", i);
+                prev = r;
+            }
+            prop_assert_eq!(sb.rank1(len), sb.count_ones());
+        }
+
+        #[test]
+        fn proptest_count_ones_plus_zeros_equals_len((ref bitmap, len) in bitmap_strategy()) {
+            let sb = SuccinctBitmap::build(bitmap, len);
+            prop_assert_eq!(sb.count_ones() + sb.count_zeros(), sb.len());
+        }
+
+        #[test]
+        fn proptest_find_free_returns_zero_bit((ref bitmap, len) in bitmap_strategy(), start in 0_u32..4096) {
+            let sb = SuccinctBitmap::build(bitmap, len);
+            let start = start % (len + 1); // Clamp to valid range.
+            if let Some(pos) = sb.find_free(start) {
+                prop_assert!(pos < len, "find_free returned {} >= len {}", pos, len);
+                prop_assert!(!sb.get_bit(pos), "find_free({}) returned {} which is a 1-bit", start, pos);
+            } else {
+                prop_assert_eq!(sb.count_zeros(), 0, "find_free returned None but there are free bits");
+            }
+        }
+
+        #[test]
+        fn proptest_find_contiguous_returns_valid_run(
+            (ref bitmap, len) in bitmap_strategy(),
+            n in 1_u32..64,
+        ) {
+            let sb = SuccinctBitmap::build(bitmap, len);
+            if let Some(start) = sb.find_contiguous(n) {
+                prop_assert!(start + n <= len, "contiguous run [{}, {}) exceeds len {}", start, start + n, len);
+                for i in start..start + n {
+                    prop_assert!(!sb.get_bit(i), "bit {} in contiguous run [{}, {}) is set", i, start, start + n);
+                }
+            }
+        }
     }
 }

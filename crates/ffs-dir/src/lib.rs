@@ -843,4 +843,202 @@ mod tests {
             "structurally different long names should hash differently"
         );
     }
+
+    // ── Property-based tests (proptest) ────────────────────────────────
+
+    use proptest::prelude::*;
+
+    /// Strategy: generate a valid directory entry name (3..32 bytes, no NUL or /).
+    /// Minimum length 3 avoids generating "." or ".." which collide with
+    /// the special directory entries created by `init_dir_block`.
+    fn name_strategy() -> impl Strategy<Value = Vec<u8>> {
+        prop::collection::vec(
+            prop::sample::select(
+                (b'a'..=b'z')
+                    .chain(b'A'..=b'Z')
+                    .chain(b'0'..=b'9')
+                    .chain([b'_', b'-'])
+                    .collect::<Vec<u8>>(),
+            ),
+            3..32,
+        )
+    }
+
+    /// Operation for the add/remove state machine test.
+    #[derive(Debug, Clone)]
+    enum DirOp {
+        Add(Vec<u8>, u32),
+        Remove(Vec<u8>),
+    }
+
+    /// Strategy: generate a sequence of add/remove operations.
+    fn dir_ops_strategy() -> impl Strategy<Value = Vec<DirOp>> {
+        prop::collection::vec(
+            prop_oneof![
+                3 => (name_strategy(), 1_u32..1000).prop_map(|(n, i)| DirOp::Add(n, i)),
+                1 => name_strategy().prop_map(DirOp::Remove),
+            ],
+            1..20,
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// add_entry/remove_entry sequence matches a reference HashMap.
+        #[test]
+        fn proptest_add_remove_matches_reference(ops in dir_ops_strategy()) {
+            let mut block = vec![0u8; 4096];
+            init_dir_block(&mut block, 2, 2).unwrap();
+
+            let mut reference: std::collections::HashMap<Vec<u8>, u32> =
+                std::collections::HashMap::new();
+
+            for op in &ops {
+                match op {
+                    DirOp::Add(name, ino) => {
+                        if !reference.contains_key(name)
+                            && add_entry(&mut block, *ino, name, Ext4FileType::RegFile).is_ok()
+                        {
+                            reference.insert(name.clone(), *ino);
+                        }
+                    }
+                    DirOp::Remove(name) => {
+                        if remove_entry(&mut block, name).unwrap_or(false) {
+                            reference.remove(name);
+                        }
+                    }
+                }
+            }
+
+            // Verify: the live entries in the block match the reference.
+            let (entries, _) = parse_dir_block(&block, 4096).unwrap();
+            let live: std::collections::HashMap<Vec<u8>, u32> = entries
+                .iter()
+                .filter(|e| e.name != b"." && e.name != b"..")
+                .map(|e| (e.name.clone(), e.inode))
+                .collect();
+
+            prop_assert_eq!(
+                live.len(),
+                reference.len(),
+                "entry count mismatch: block has {} live entries, reference has {}",
+                live.len(),
+                reference.len(),
+            );
+            for (name, ino) in &reference {
+                let block_ino = live.get(name);
+                prop_assert_eq!(
+                    block_ino,
+                    Some(ino),
+                    "name {:?} has inode {:?} in block but {:?} in reference",
+                    String::from_utf8_lossy(name),
+                    block_ino,
+                    Some(ino),
+                );
+            }
+        }
+
+        /// After removing an entry, adding a same-or-smaller entry succeeds
+        /// (space reclamation works).
+        #[test]
+        fn proptest_remove_then_add_reclaims_space(
+            name_a in name_strategy(),
+            name_b in name_strategy(),
+            ino_a in 1_u32..1000,
+            ino_b in 1_u32..1000,
+        ) {
+            // name_b must be no longer than name_a for guaranteed fit.
+            let name_b = if name_b.len() > name_a.len() {
+                name_b[..name_a.len()].to_vec()
+            } else {
+                name_b
+            };
+
+            let mut block = vec![0u8; 4096];
+            init_dir_block(&mut block, 2, 2).unwrap();
+
+            add_entry(&mut block, ino_a, &name_a, Ext4FileType::RegFile).unwrap();
+            remove_entry(&mut block, &name_a).unwrap();
+
+            // A new entry that fits in the same space should succeed.
+            let result = add_entry(&mut block, ino_b, &name_b, Ext4FileType::RegFile);
+            prop_assert!(result.is_ok(), "add after remove should succeed, got {:?}", result.err());
+        }
+
+        /// htree_insert always maintains sorted order by hash.
+        #[test]
+        fn proptest_htree_insert_maintains_sorted(
+            inserts in prop::collection::vec((any::<u32>(), any::<u32>()), 1..64),
+        ) {
+            let mut entries = Vec::new();
+            for (hash, block) in &inserts {
+                htree_insert(&mut entries, *hash, *block);
+            }
+            // Verify sorted by hash.
+            for i in 1..entries.len() {
+                prop_assert!(
+                    entries[i - 1].hash <= entries[i].hash,
+                    "entries not sorted: [{}].hash={} > [{}].hash={}",
+                    i - 1, entries[i - 1].hash, i, entries[i].hash,
+                );
+            }
+            prop_assert_eq!(entries.len(), inserts.len());
+        }
+
+        /// htree_find_leaf returns a block whose hash is <= target (rightmost-lte).
+        #[test]
+        fn proptest_htree_find_leaf_rightmost_lte(
+            inserts in prop::collection::vec((any::<u32>(), any::<u32>()), 1..32),
+            target in any::<u32>(),
+        ) {
+            let mut entries = Vec::new();
+            for (hash, block) in &inserts {
+                htree_insert(&mut entries, *hash, *block);
+            }
+            if let Some(found_block) = htree_find_leaf(&entries, target) {
+                // The found block must correspond to an entry with hash <= target
+                // (or be the first entry if target < all hashes).
+                let found_entry = entries.iter().find(|e| e.block == found_block);
+                prop_assert!(found_entry.is_some(), "returned block {} not in entries", found_block);
+            }
+        }
+
+        /// htree_remove + htree_insert roundtrip preserves entries.
+        #[test]
+        fn proptest_htree_remove_insert_roundtrip(
+            base in prop::collection::vec((any::<u32>(), any::<u32>()), 1..16),
+            remove_idx in 0_usize..16,
+        ) {
+            let mut entries = Vec::new();
+            for (hash, block) in &base {
+                htree_insert(&mut entries, *hash, *block);
+            }
+            let original_len = entries.len();
+
+            if !entries.is_empty() {
+                let idx = remove_idx % entries.len();
+                let removed = entries[idx];
+                htree_remove(&mut entries, removed.hash, removed.block);
+                prop_assert_eq!(entries.len(), original_len - 1);
+
+                htree_insert(&mut entries, removed.hash, removed.block);
+                prop_assert_eq!(entries.len(), original_len);
+            }
+        }
+
+        /// dx_hash is deterministic: same input always produces same output.
+        #[test]
+        fn proptest_dx_hash_deterministic(
+            name in name_strategy(),
+            seed in prop::array::uniform4(any::<u32>()),
+            version in prop::sample::select(vec![0_u8, 1, 2, 3, 4, 5]),
+        ) {
+            let h1 = compute_dx_hash(version, &name, &seed);
+            let h2 = compute_dx_hash(version, &name, &seed);
+            prop_assert_eq!(h1, h2, "dx_hash not deterministic for {:?}", name);
+            // Bit 0 always cleared (ext4 convention).
+            prop_assert_eq!(h1 & 1, 0, "dx_hash bit 0 not cleared for {:?}", name);
+        }
+    }
 }

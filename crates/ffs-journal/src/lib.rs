@@ -229,6 +229,15 @@ fn replay_jbd2_inner(
                     .descriptor_tags
                     .saturating_add(u64::try_from(tags.len()).unwrap_or(u64::MAX));
 
+                // Check if all data blocks fit within the journal region.
+                // A truncated descriptor (e.g. from power loss) means this
+                // transaction is incomplete — stop scanning.
+                let tag_count = u64::try_from(tags.len()).unwrap_or(u64::MAX);
+                let last_data_idx = idx.checked_add(tag_count);
+                if last_data_idx.is_none_or(|ld| ld >= total_blocks) {
+                    break;
+                }
+
                 let mut staged = Vec::with_capacity(tags.len());
                 for (tag_idx, tag) in tags.iter().enumerate() {
                     let offset_from_descriptor = u64::try_from(tag_idx)
@@ -2336,5 +2345,461 @@ mod tests {
 
         assert_eq!(txn.write_count(), 2);
         assert_eq!(txn.revoke_count(), 1);
+    }
+
+    // ── Adversarial journal replay tests ─────────────────────────────────
+
+    #[test]
+    fn adversarial_truncated_descriptor_at_journal_end() {
+        // Descriptor claims 3 data blocks but only 1 follows before the
+        // journal region ends. Replay should treat this as an incomplete
+        // transaction and succeed (not return an error).
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+        let region = JournalRegion {
+            start: BlockNumber(10),
+            blocks: 3, // Only room for descriptor + 1 data block + 1 more
+        };
+
+        // Descriptor says 3 tags → needs 3 data blocks after it, but only
+        // 2 slots remain in the region.
+        let desc = descriptor_block(512, 1, &[(3, 0), (4, 0), (5, JBD2_TAG_FLAG_LAST)]);
+        dev.raw_write(BlockNumber(10), desc);
+        dev.raw_write(BlockNumber(11), vec![0xAA; 512]);
+        dev.raw_write(BlockNumber(12), vec![0xBB; 512]);
+
+        let out =
+            replay_jbd2(&cx, &dev, region).expect("truncated descriptor should not cause error");
+
+        // No commit block present, so nothing should be replayed.
+        assert!(out.committed_sequences.is_empty());
+        // Target blocks should remain untouched.
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(3)).unwrap().as_slice(),
+            &[0_u8; 512]
+        );
+    }
+
+    #[test]
+    fn adversarial_truncated_descriptor_after_valid_txn() {
+        // First transaction is complete and committed. Second transaction
+        // has a truncated descriptor at the journal end. The first
+        // transaction should still be replayed successfully.
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+        let region = JournalRegion {
+            start: BlockNumber(10),
+            blocks: 6,
+        };
+
+        // Txn 1: complete (desc + data + commit = 3 blocks)
+        dev.raw_write(
+            BlockNumber(10),
+            descriptor_block(512, 1, &[(3, JBD2_TAG_FLAG_LAST)]),
+        );
+        dev.raw_write(BlockNumber(11), vec![0xAA; 512]);
+        dev.raw_write(BlockNumber(12), commit_block(512, 1));
+
+        // Txn 2: truncated descriptor claiming 3 data blocks, only 2 slots
+        // remain in region (blocks 13, 14, 15 → 3 slots but need desc + 3).
+        dev.raw_write(
+            BlockNumber(13),
+            descriptor_block(512, 2, &[(4, 0), (5, 0), (6, JBD2_TAG_FLAG_LAST)]),
+        );
+        dev.raw_write(BlockNumber(14), vec![0xBB; 512]);
+        dev.raw_write(BlockNumber(15), vec![0xCC; 512]);
+
+        let out =
+            replay_jbd2(&cx, &dev, region).expect("should succeed despite truncated second txn");
+
+        // First transaction should be replayed.
+        assert_eq!(out.committed_sequences, vec![1]);
+        assert_eq!(out.stats.replayed_blocks, 1);
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(3)).unwrap().as_slice(),
+            &[0xAA; 512]
+        );
+
+        // Second transaction's targets should be untouched.
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(4)).unwrap().as_slice(),
+            &[0_u8; 512]
+        );
+    }
+
+    #[test]
+    fn adversarial_orphaned_commit_no_descriptor() {
+        // A commit block with no preceding descriptor for that sequence.
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+        let region = JournalRegion {
+            start: BlockNumber(10),
+            blocks: 4,
+        };
+
+        dev.raw_write(BlockNumber(10), commit_block(512, 42));
+
+        let out = replay_jbd2(&cx, &dev, region).expect("should succeed");
+
+        // The commit is recorded but there are no writes to replay.
+        assert_eq!(out.committed_sequences, vec![42]);
+        assert_eq!(out.stats.commit_blocks, 1);
+        assert_eq!(out.stats.replayed_blocks, 0);
+        assert_eq!(out.stats.orphaned_commit_blocks, 1);
+    }
+
+    #[test]
+    fn adversarial_unknown_block_type_skipped() {
+        // A valid JBD2 header with an unknown block_type should be skipped
+        // without causing an error.
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+        let region = JournalRegion {
+            start: BlockNumber(10),
+            blocks: 8,
+        };
+
+        // Block 10: unknown type (99).
+        let mut unknown = vec![0_u8; 512];
+        encode_jbd2_header(&mut unknown, 99, 1);
+        dev.raw_write(BlockNumber(10), unknown);
+
+        // Block 11-13: valid committed transaction.
+        dev.raw_write(
+            BlockNumber(11),
+            descriptor_block(512, 5, &[(3, JBD2_TAG_FLAG_LAST)]),
+        );
+        dev.raw_write(BlockNumber(12), vec![0xDD; 512]);
+        dev.raw_write(BlockNumber(13), commit_block(512, 5));
+
+        let out = replay_jbd2(&cx, &dev, region).expect("should succeed");
+
+        assert_eq!(out.committed_sequences, vec![5]);
+        assert_eq!(out.stats.replayed_blocks, 1);
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(3)).unwrap().as_slice(),
+            &[0xDD; 512]
+        );
+    }
+
+    #[test]
+    fn adversarial_out_of_order_sequence_numbers() {
+        // Transactions committed out of sequence order (seq 20 then seq 10).
+        // Both should be replayed. Later-in-journal wins for same target.
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+        let region = JournalRegion {
+            start: BlockNumber(10),
+            blocks: 16,
+        };
+
+        // First in journal: seq 20 writes 0xAA to block 3.
+        dev.raw_write(
+            BlockNumber(10),
+            descriptor_block(512, 20, &[(3, JBD2_TAG_FLAG_LAST)]),
+        );
+        dev.raw_write(BlockNumber(11), vec![0xAA; 512]);
+        dev.raw_write(BlockNumber(12), commit_block(512, 20));
+
+        // Second in journal: seq 10 writes 0xBB to block 3.
+        dev.raw_write(
+            BlockNumber(13),
+            descriptor_block(512, 10, &[(3, JBD2_TAG_FLAG_LAST)]),
+        );
+        dev.raw_write(BlockNumber(14), vec![0xBB; 512]);
+        dev.raw_write(BlockNumber(15), commit_block(512, 10));
+
+        let out = replay_jbd2(&cx, &dev, region).expect("should succeed");
+
+        // Both sequences committed. Replay processes in seq order (10, 20).
+        // seq 10 writes 0xBB, then seq 20 writes 0xAA. Final value = 0xAA
+        // because committed_sequences are iterated in sorted order (BTreeSet).
+        assert_eq!(out.committed_sequences.len(), 2);
+        assert!(out.committed_sequences.contains(&10));
+        assert!(out.committed_sequences.contains(&20));
+
+        let target = dev.read_block(&cx, BlockNumber(3)).unwrap();
+        // seq 10 → 0xBB, seq 20 → 0xAA; sorted order means 20 is applied last.
+        assert_eq!(target.as_slice(), &[0xAA; 512]);
+    }
+
+    #[test]
+    fn adversarial_duplicate_commits_same_sequence() {
+        // Two commit blocks for the same sequence number. Should not
+        // cause duplication of writes.
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+        let region = JournalRegion {
+            start: BlockNumber(10),
+            blocks: 8,
+        };
+
+        dev.raw_write(
+            BlockNumber(10),
+            descriptor_block(512, 7, &[(3, JBD2_TAG_FLAG_LAST)]),
+        );
+        dev.raw_write(BlockNumber(11), vec![0xEE; 512]);
+        dev.raw_write(BlockNumber(12), commit_block(512, 7));
+        dev.raw_write(BlockNumber(13), commit_block(512, 7)); // Duplicate commit.
+
+        let out = replay_jbd2(&cx, &dev, region).expect("should succeed");
+
+        // Sequence 7 committed (BTreeSet deduplicates).
+        assert_eq!(out.committed_sequences, vec![7]);
+        assert_eq!(out.stats.commit_blocks, 2);
+        assert_eq!(out.stats.replayed_blocks, 1);
+
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(3)).unwrap().as_slice(),
+            &[0xEE; 512]
+        );
+    }
+
+    #[test]
+    fn adversarial_cross_txn_revoke_supersedes_earlier_write() {
+        // Seq 1 writes block 5. Seq 2 revokes block 5.
+        // After replay, block 5 should NOT have seq 1's data because
+        // the revoke in seq 2 supersedes seq 1's write (seq 2 > seq 1).
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+        let region = JournalRegion {
+            start: BlockNumber(10),
+            blocks: 16,
+        };
+
+        // Seq 1: descriptor + data for block 5 + commit.
+        dev.raw_write(
+            BlockNumber(10),
+            descriptor_block(512, 1, &[(5, JBD2_TAG_FLAG_LAST)]),
+        );
+        dev.raw_write(BlockNumber(11), vec![0xAA; 512]);
+        dev.raw_write(BlockNumber(12), commit_block(512, 1));
+
+        // Seq 2: revoke block 5 + commit.
+        dev.raw_write(BlockNumber(13), revoke_block(512, 2, &[5]));
+        dev.raw_write(BlockNumber(14), commit_block(512, 2));
+
+        let out = replay_jbd2(&cx, &dev, region).expect("should succeed");
+
+        assert_eq!(out.committed_sequences.len(), 2);
+        // The write from seq 1 to block 5 should be skipped because seq 2
+        // revokes it (seq 1 <= revoke seq 2).
+        assert_eq!(out.stats.skipped_revoked_blocks, 1);
+        assert_eq!(out.stats.replayed_blocks, 0);
+
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(5)).unwrap().as_slice(),
+            &[0_u8; 512],
+            "block 5 should remain untouched due to cross-txn revoke"
+        );
+    }
+
+    #[test]
+    fn adversarial_revoke_does_not_affect_later_write() {
+        // Seq 1 revokes block 5. Seq 2 writes block 5.
+        // The write in seq 2 should succeed because revoke in seq 1 only
+        // affects writes with seq <= 1.
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+        let region = JournalRegion {
+            start: BlockNumber(10),
+            blocks: 16,
+        };
+
+        // Seq 1: revoke block 5 + commit.
+        dev.raw_write(BlockNumber(10), revoke_block(512, 1, &[5]));
+        dev.raw_write(BlockNumber(11), commit_block(512, 1));
+
+        // Seq 2: write block 5 + commit.
+        dev.raw_write(
+            BlockNumber(12),
+            descriptor_block(512, 2, &[(5, JBD2_TAG_FLAG_LAST)]),
+        );
+        dev.raw_write(BlockNumber(13), vec![0xBB; 512]);
+        dev.raw_write(BlockNumber(14), commit_block(512, 2));
+
+        let out = replay_jbd2(&cx, &dev, region).expect("should succeed");
+
+        assert_eq!(out.committed_sequences.len(), 2);
+        assert_eq!(out.stats.replayed_blocks, 1);
+        assert_eq!(out.stats.skipped_revoked_blocks, 0);
+
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(5)).unwrap().as_slice(),
+            &[0xBB; 512],
+            "later write should not be affected by earlier revoke"
+        );
+    }
+
+    #[test]
+    fn adversarial_garbage_between_valid_transactions() {
+        // Valid txn, then garbage block, then another valid txn.
+        // Both valid transactions should be replayed.
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+        let region = JournalRegion {
+            start: BlockNumber(10),
+            blocks: 16,
+        };
+
+        // Txn 1: seq 1, writes block 3.
+        dev.raw_write(
+            BlockNumber(10),
+            descriptor_block(512, 1, &[(3, JBD2_TAG_FLAG_LAST)]),
+        );
+        dev.raw_write(BlockNumber(11), vec![0xAA; 512]);
+        dev.raw_write(BlockNumber(12), commit_block(512, 1));
+
+        // Garbage block.
+        dev.raw_write(BlockNumber(13), vec![0xFF; 512]);
+
+        // Txn 2: seq 2, writes block 4.
+        dev.raw_write(
+            BlockNumber(14),
+            descriptor_block(512, 2, &[(4, JBD2_TAG_FLAG_LAST)]),
+        );
+        dev.raw_write(BlockNumber(15), vec![0xBB; 512]);
+        dev.raw_write(BlockNumber(16), commit_block(512, 2));
+
+        let out = replay_jbd2(&cx, &dev, region).expect("should succeed");
+
+        assert_eq!(out.committed_sequences, vec![1, 2]);
+        assert_eq!(out.stats.replayed_blocks, 2);
+
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(3)).unwrap().as_slice(),
+            &[0xAA; 512]
+        );
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(4)).unwrap().as_slice(),
+            &[0xBB; 512]
+        );
+    }
+
+    #[test]
+    fn adversarial_single_block_journal_region() {
+        // A journal region with only 1 block. Anything there must be
+        // a non-descriptor header or garbage.
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+        let region = JournalRegion {
+            start: BlockNumber(10),
+            blocks: 1,
+        };
+
+        // A lone commit block in a 1-block region.
+        dev.raw_write(BlockNumber(10), commit_block(512, 1));
+
+        let out = replay_jbd2(&cx, &dev, region).expect("should succeed");
+        assert_eq!(out.committed_sequences, vec![1]);
+        assert_eq!(out.stats.orphaned_commit_blocks, 1);
+        assert_eq!(out.stats.replayed_blocks, 0);
+    }
+
+    #[test]
+    fn adversarial_descriptor_with_zero_tags() {
+        // A descriptor block where all tag slots are zero (no valid tags).
+        // Should be handled gracefully.
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+        let region = JournalRegion {
+            start: BlockNumber(10),
+            blocks: 4,
+        };
+
+        // Descriptor with no tags (all zeros after header).
+        let mut desc = vec![0_u8; 512];
+        encode_jbd2_header(&mut desc, JBD2_BLOCKTYPE_DESCRIPTOR, 1);
+        // Tags area is all zeros → parse_descriptor_tags returns empty vec.
+        dev.raw_write(BlockNumber(10), desc);
+        dev.raw_write(BlockNumber(11), commit_block(512, 1));
+
+        let out = replay_jbd2(&cx, &dev, region).expect("should succeed");
+        assert_eq!(out.committed_sequences, vec![1]);
+        assert_eq!(out.stats.descriptor_blocks, 1);
+        assert_eq!(out.stats.descriptor_tags, 0);
+        assert_eq!(out.stats.replayed_blocks, 0);
+    }
+
+    #[test]
+    fn adversarial_revoke_r_count_exceeds_block_size() {
+        // A revoke block where r_count claims more entries than fit in the
+        // block. parse_revoke_entries clamps to block.len().
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+        let region = JournalRegion {
+            start: BlockNumber(10),
+            blocks: 8,
+        };
+
+        // Descriptor + data + revoke with inflated r_count + commit.
+        dev.raw_write(
+            BlockNumber(10),
+            descriptor_block(512, 1, &[(5, JBD2_TAG_FLAG_LAST)]),
+        );
+        dev.raw_write(BlockNumber(11), vec![0xAA; 512]);
+
+        // Craft a revoke block with r_count = 0xFFFF_FFFF (way more than
+        // fits in 512 bytes). Only the entries that actually fit should be
+        // parsed.
+        let mut rev = vec![0_u8; 512];
+        encode_jbd2_header(&mut rev, JBD2_BLOCKTYPE_REVOKE, 1);
+        rev[12..16].copy_from_slice(&0xFFFF_FFFF_u32.to_be_bytes());
+        // Write one actual revoke entry for block 5.
+        rev[16..20].copy_from_slice(&5_u32.to_be_bytes());
+        dev.raw_write(BlockNumber(12), rev);
+
+        dev.raw_write(BlockNumber(13), commit_block(512, 1));
+
+        let out = replay_jbd2(&cx, &dev, region).expect("should succeed");
+
+        assert_eq!(out.committed_sequences, vec![1]);
+        // Block 5 should be revoked despite the inflated r_count.
+        assert_eq!(out.stats.skipped_revoked_blocks, 1);
+        assert_eq!(out.stats.replayed_blocks, 0);
+    }
+
+    #[test]
+    fn adversarial_many_descriptors_same_sequence() {
+        // Multiple descriptor blocks for the same sequence number,
+        // each contributing writes. All should be accumulated.
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 64);
+        let region = JournalRegion {
+            start: BlockNumber(10),
+            blocks: 16,
+        };
+
+        // First descriptor for seq 1: writes block 3.
+        dev.raw_write(
+            BlockNumber(10),
+            descriptor_block(512, 1, &[(3, JBD2_TAG_FLAG_LAST)]),
+        );
+        dev.raw_write(BlockNumber(11), vec![0xAA; 512]);
+
+        // Second descriptor for seq 1: writes block 4.
+        dev.raw_write(
+            BlockNumber(12),
+            descriptor_block(512, 1, &[(4, JBD2_TAG_FLAG_LAST)]),
+        );
+        dev.raw_write(BlockNumber(13), vec![0xBB; 512]);
+
+        // Single commit for seq 1.
+        dev.raw_write(BlockNumber(14), commit_block(512, 1));
+
+        let out = replay_jbd2(&cx, &dev, region).expect("should succeed");
+
+        assert_eq!(out.committed_sequences, vec![1]);
+        assert_eq!(out.stats.descriptor_blocks, 2);
+        assert_eq!(out.stats.replayed_blocks, 2);
+
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(3)).unwrap().as_slice(),
+            &[0xAA; 512]
+        );
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(4)).unwrap().as_slice(),
+            &[0xBB; 512]
+        );
     }
 }

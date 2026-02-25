@@ -1747,4 +1747,266 @@ mod tests {
             "first free block should be after reserved area"
         );
     }
+
+    // ── Property-based tests (proptest) ────────────────────────────────
+
+    use proptest::prelude::*;
+
+    /// Strategy: generate a bitmap of 1..128 bytes with a valid bit count.
+    fn bitmap_strat() -> impl Strategy<Value = (Vec<u8>, u32)> {
+        (1_usize..128).prop_flat_map(|byte_len| {
+            let max_bits =
+                u32::try_from(byte_len * 8).expect("byte_len bound keeps bit length within u32");
+            (prop::collection::vec(any::<u8>(), byte_len), 1..=max_bits)
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn proptest_bitmap_set_get_roundtrip(
+            byte_len in 1_usize..64,
+            idx_seed in any::<u32>(),
+        ) {
+            let total_bits =
+                u32::try_from(byte_len * 8).expect("byte_len bound keeps bit length within u32");
+            let idx = idx_seed % total_bits;
+            let mut bm = vec![0u8; byte_len];
+            prop_assert!(!bitmap_get(&bm, idx));
+            bitmap_set(&mut bm, idx);
+            prop_assert!(bitmap_get(&bm, idx));
+            bitmap_clear(&mut bm, idx);
+            prop_assert!(!bitmap_get(&bm, idx));
+        }
+
+        #[test]
+        fn proptest_bitmap_count_free_consistency((ref bm, count) in bitmap_strat()) {
+            let free = bitmap_count_free(bm, count);
+            // Manual count for verification.
+            let manual_free =
+                (0..count).fold(0_u32, |acc, i| acc + u32::from(!bitmap_get(bm, i)));
+            prop_assert_eq!(free, manual_free);
+            // Ones + zeros = total.
+            let used = (0..count).fold(0_u32, |acc, i| acc + u32::from(bitmap_get(bm, i)));
+            prop_assert_eq!(free + used, count);
+        }
+
+        #[test]
+        fn proptest_bitmap_find_free_returns_zero_bit(
+            (ref bm, count) in bitmap_strat(),
+            start_seed in any::<u32>(),
+        ) {
+            let start = start_seed % count;
+            if let Some(pos) = bitmap_find_free(bm, count, start) {
+                prop_assert!(pos < count, "found pos {} >= count {}", pos, count);
+                prop_assert!(!bitmap_get(bm, pos), "bit {} is set but find_free returned it", pos);
+            } else {
+                // All bits should be set.
+                let free = bitmap_count_free(bm, count);
+                prop_assert_eq!(free, 0, "find_free returned None but {} bits are free", free);
+            }
+        }
+
+        #[test]
+        fn proptest_bitmap_find_contiguous_valid_run(
+            (ref bm, count) in bitmap_strat(),
+            n in 1_u32..32,
+            start_seed in any::<u32>(),
+        ) {
+            let start = start_seed % count;
+            if let Some(pos) = bitmap_find_contiguous(bm, count, n, start) {
+                prop_assert!(pos + n <= count, "run [{}, {}) exceeds count {}", pos, pos + n, count);
+                for i in pos..pos + n {
+                    prop_assert!(
+                        !bitmap_get(bm, i),
+                        "bit {} in contiguous run [{}, {}) is set",
+                        i, pos, pos + n,
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn proptest_alloc_free_roundtrip_preserves_free_count(
+            num_allocs in 1_u32..8,
+        ) {
+            let cx = test_cx();
+            let dev = MemBlockDevice::new(4096);
+            let geo = make_geometry();
+            let mut groups = make_groups(&geo);
+            let original_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
+
+            let mut allocations = Vec::new();
+            for _ in 0..num_allocs {
+                match alloc_blocks(&cx, &dev, &geo, &mut groups, 1, &AllocHint::default()) {
+                    Ok(a) => allocations.push(a),
+                    Err(_) => break,
+                }
+            }
+
+            let after_alloc_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
+            let allocated_count = u32::try_from(allocations.len())
+                .expect("allocation count fits in u32 for test bounds");
+            prop_assert_eq!(
+                after_alloc_free,
+                original_free - allocated_count,
+                "free count after alloc: expected {}, got {}",
+                original_free - allocated_count,
+                after_alloc_free,
+            );
+
+            // Free all allocated blocks.
+            for a in &allocations {
+                free_blocks(&cx, &dev, &geo, &mut groups, a.start, a.count).unwrap();
+            }
+
+            let final_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
+            prop_assert_eq!(
+                final_free,
+                original_free,
+                "free count after free: expected {}, got {}",
+                original_free,
+                final_free,
+            );
+        }
+
+        /// Multi-block alloc/free roundtrip with varying block counts.
+        #[test]
+        fn proptest_multi_block_alloc_free_roundtrip(
+            block_count in 1_u32..16,
+            num_allocs in 1_u32..5,
+        ) {
+            let cx = test_cx();
+            let dev = MemBlockDevice::new(4096);
+            let geo = make_geometry();
+            let mut groups = make_groups(&geo);
+            let original_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
+
+            let mut allocations = Vec::new();
+            let mut total_allocated = 0_u32;
+            for _ in 0..num_allocs {
+                match alloc_blocks(&cx, &dev, &geo, &mut groups, block_count, &AllocHint::default()) {
+                    Ok(a) => {
+                        total_allocated += a.count;
+                        allocations.push(a);
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            let after_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
+            prop_assert_eq!(
+                after_free,
+                original_free - total_allocated,
+            );
+
+            for a in &allocations {
+                free_blocks(&cx, &dev, &geo, &mut groups, a.start, a.count).unwrap();
+            }
+
+            let final_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
+            prop_assert_eq!(final_free, original_free);
+        }
+
+        /// Allocated blocks are actually marked in the bitmap.
+        #[test]
+        fn proptest_alloc_marks_bitmap_bits(
+            block_count in 1_u32..8,
+        ) {
+            let cx = test_cx();
+            let dev = MemBlockDevice::new(4096);
+            let geo = make_geometry();
+            let mut groups = make_groups(&geo);
+
+            let alloc = alloc_blocks(
+                &cx, &dev, &geo, &mut groups, block_count, &AllocHint::default(),
+            ).unwrap();
+
+            // Read the bitmap for the group that owns the allocation.
+            let (group, rel_start) = geo.absolute_to_group_block(alloc.start);
+            let bitmap_block = groups[group.0 as usize].block_bitmap_block;
+            let bm = dev.read_block(&cx, bitmap_block).unwrap();
+
+            for i in 0..alloc.count {
+                let bit = rel_start + i;
+                prop_assert!(
+                    bitmap_get(bm.as_slice(), bit),
+                    "bit {} in group {} should be set after alloc",
+                    bit, group.0,
+                );
+            }
+        }
+
+        /// No two allocations ever overlap.
+        #[test]
+        fn proptest_alloc_no_overlaps(
+            num_allocs in 2_u32..12,
+        ) {
+            let cx = test_cx();
+            let dev = MemBlockDevice::new(4096);
+            let geo = make_geometry();
+            let mut groups = make_groups(&geo);
+
+            let mut allocations = Vec::new();
+            for _ in 0..num_allocs {
+                match alloc_blocks(&cx, &dev, &geo, &mut groups, 1, &AllocHint::default()) {
+                    Ok(a) => allocations.push(a),
+                    Err(_) => break,
+                }
+            }
+
+            // Check no two allocations share the same block.
+            for i in 0..allocations.len() {
+                for j in (i + 1)..allocations.len() {
+                    let a = &allocations[i];
+                    let b = &allocations[j];
+                    let a_end = a.start.0 + u64::from(a.count);
+                    let b_end = b.start.0 + u64::from(b.count);
+                    let overlaps = a.start.0 < b_end && b.start.0 < a_end;
+                    prop_assert!(
+                        !overlaps,
+                        "allocations {} [{}, {}) and {} [{}, {}) overlap",
+                        i, a.start.0, a_end,
+                        j, b.start.0, b_end,
+                    );
+                }
+            }
+        }
+
+        /// bitmap_find_contiguous with wraparound: if a run is found, it must
+        /// consist of contiguous zero bits regardless of the start position.
+        #[test]
+        fn proptest_find_contiguous_wraparound_valid(
+            byte_len in 1_usize..32,
+            fill_percent in 0_u8..80,
+            n in 1_u32..8,
+            start_seed in any::<u32>(),
+        ) {
+            let total_bits =
+                u32::try_from(byte_len * 8).expect("byte_len bound keeps bit length within u32");
+            let mut bm = vec![0u8; byte_len];
+
+            // Randomly fill some fraction of bits.
+            let bits_to_set = (u32::from(fill_percent) * total_bits) / 100;
+            // Deterministic pattern based on fill fraction.
+            for i in 0..bits_to_set.min(total_bits) {
+                let bit = (i.wrapping_mul(7) + i.wrapping_mul(13)) % total_bits;
+                bitmap_set(&mut bm, bit);
+            }
+
+            let start = start_seed % total_bits;
+            if let Some(pos) = bitmap_find_contiguous(&bm, total_bits, n, start) {
+                // Entire run must be within bounds and all bits clear.
+                prop_assert!(pos + n <= total_bits);
+                for i in pos..pos + n {
+                    prop_assert!(
+                        !bitmap_get(&bm, i),
+                        "bit {} in run [{}, {}) should be clear (start={})",
+                        i, pos, pos + n, start,
+                    );
+                }
+            }
+        }
+    }
 }

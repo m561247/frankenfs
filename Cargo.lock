@@ -543,6 +543,7 @@ dependencies = [
  "ffs-error",
  "ffs-ondisk",
  "ffs-types",
+ "proptest",
 ]
 
 [[package]]
@@ -645,6 +646,7 @@ dependencies = [
  "ffs-ondisk",
  "ffs-types",
  "libc",
+ "proptest",
 ]
 
 [[package]]
@@ -753,6 +755,7 @@ dependencies = [
  "ffs-repair",
  "ffs-types",
  "parking_lot",
+ "proptest",
  "serde",
  "serde_json",
  "tempfile",
