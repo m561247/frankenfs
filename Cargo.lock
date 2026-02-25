@@ -690,6 +690,7 @@ dependencies = [
  "fuser",
  "libc",
  "parking_lot",
+ "proptest",
  "serde",
  "thiserror",
  "tracing",

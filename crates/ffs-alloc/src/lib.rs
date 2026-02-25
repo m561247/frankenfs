@@ -2129,5 +2129,307 @@ mod tests {
                 goal_group, allocated_group.0,
             );
         }
+
+        // ── FsGeometry coordinate conversion properties ─────────────
+
+        /// group_block_to_absolute → absolute_to_group_block roundtrip.
+        #[test]
+        fn proptest_geo_coordinate_roundtrip(
+            group_idx in 0_u32..4,
+            rel_block_seed in 0_u32..8192,
+        ) {
+            let geo = make_geometry();
+            let group = GroupNumber(group_idx);
+            let blocks_in = geo.blocks_in_group(group);
+            let rel_block = rel_block_seed % blocks_in;
+
+            let abs = geo.group_block_to_absolute(group, rel_block);
+            let (back_group, back_rel) = geo.absolute_to_group_block(abs);
+            prop_assert_eq!(back_group, group, "group mismatch");
+            prop_assert_eq!(back_rel, rel_block, "relative block mismatch");
+        }
+
+        /// blocks_in_group is always <= blocks_per_group.
+        #[test]
+        fn proptest_blocks_in_group_bounded(group_idx in 0_u32..4) {
+            let geo = make_geometry();
+            let blocks = geo.blocks_in_group(GroupNumber(group_idx));
+            prop_assert!(blocks <= geo.blocks_per_group);
+            prop_assert!(blocks > 0);
+        }
+
+        /// inodes_in_group is always <= inodes_per_group.
+        #[test]
+        fn proptest_inodes_in_group_bounded(group_idx in 0_u32..4) {
+            let geo = make_geometry();
+            let inodes = geo.inodes_in_group(GroupNumber(group_idx));
+            prop_assert!(inodes <= geo.inodes_per_group);
+            prop_assert!(inodes > 0);
+        }
+
+        /// Sum of blocks_in_group across all groups = total_blocks - first_data_block.
+        #[test]
+        fn proptest_blocks_sum_equals_total(
+            bpg in prop::sample::select(vec![1024_u32, 2048, 4096, 8192]),
+            total_blocks_mult in 1_u64..=8,
+        ) {
+            let total_blocks = u64::from(bpg) * total_blocks_mult;
+            let group_count = total_blocks.div_ceil(u64::from(bpg));
+            if group_count > u64::from(u32::MAX) { return Ok(()); }
+            #[expect(clippy::cast_possible_truncation)]
+            let gc = group_count as u32;
+            let geo = FsGeometry {
+                blocks_per_group: bpg,
+                inodes_per_group: 256,
+                block_size: 4096,
+                total_blocks,
+                total_inodes: gc * 256,
+                first_data_block: 0,
+                group_count: gc,
+                inode_size: 256,
+            };
+            let sum: u64 = (0..gc).map(|g| u64::from(geo.blocks_in_group(GroupNumber(g)))).sum();
+            prop_assert_eq!(sum, total_blocks);
+        }
+
+        // ── Bitmap edge case properties ─────────────────────────────
+
+        /// bitmap_find_contiguous with n=0 always returns Some(0).
+        #[test]
+        fn proptest_find_contiguous_zero_always_succeeds(
+            (ref bm, count) in bitmap_strat(),
+            start_seed in any::<u32>(),
+        ) {
+            let start = start_seed % count;
+            let result = bitmap_find_contiguous(bm, count, 0, start);
+            prop_assert_eq!(result, Some(0));
+        }
+
+        /// bitmap_get beyond bitmap length returns false.
+        #[test]
+        fn proptest_bitmap_get_oob_is_false(
+            byte_len in 1_usize..32,
+            beyond in 0_u32..100,
+        ) {
+            let bm = vec![0xFF_u8; byte_len];
+            let total = u32::try_from(byte_len * 8).unwrap();
+            let oob_idx = total + beyond;
+            prop_assert!(!bitmap_get(&bm, oob_idx));
+        }
+
+        /// bitmap_set/clear beyond length is a no-op (no panic).
+        #[test]
+        fn proptest_bitmap_set_clear_oob_noop(
+            byte_len in 1_usize..32,
+            beyond in 0_u32..100,
+        ) {
+            let mut bm = vec![0_u8; byte_len];
+            let original = bm.clone();
+            let total = u32::try_from(byte_len * 8).unwrap();
+            let oob_idx = total + beyond;
+            bitmap_set(&mut bm, oob_idx);
+            prop_assert!(bm == original, "set beyond bounds should not modify bitmap");
+            bitmap_clear(&mut bm, oob_idx);
+            prop_assert!(bm == original, "clear beyond bounds should not modify bitmap");
+        }
+
+        /// Setting a single bit increases count_free by exactly -1.
+        #[test]
+        fn proptest_set_decreases_free_by_one(
+            byte_len in 1_usize..64,
+            idx_seed in any::<u32>(),
+        ) {
+            let total_bits = u32::try_from(byte_len * 8).unwrap();
+            let idx = idx_seed % total_bits;
+            let mut bm = vec![0u8; byte_len];
+            let before = bitmap_count_free(&bm, total_bits);
+            bitmap_set(&mut bm, idx);
+            let after = bitmap_count_free(&bm, total_bits);
+            prop_assert_eq!(after, before - 1);
+        }
+
+        /// Clearing a set bit increases count_free by exactly +1.
+        #[test]
+        fn proptest_clear_increases_free_by_one(
+            byte_len in 1_usize..64,
+            idx_seed in any::<u32>(),
+        ) {
+            let total_bits = u32::try_from(byte_len * 8).unwrap();
+            let idx = idx_seed % total_bits;
+            let mut bm = vec![0xFF_u8; byte_len];
+            let before = bitmap_count_free(&bm, total_bits);
+            bitmap_clear(&mut bm, idx);
+            let after = bitmap_count_free(&bm, total_bits);
+            prop_assert_eq!(after, before + 1);
+        }
+
+        // ── Alloc/free interleaving property ────────────────────────
+
+        /// Interleaved alloc/free operations maintain free count invariant.
+        #[test]
+        fn proptest_interleaved_alloc_free_consistent(
+            ops in prop::collection::vec(prop::bool::ANY, 1..20),
+        ) {
+            let cx = test_cx();
+            let dev = MemBlockDevice::new(4096);
+            let geo = make_geometry();
+            let mut groups = make_groups(&geo);
+            let original_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
+
+            let mut allocated = Vec::new();
+            let mut net_allocated = 0_u32;
+
+            for do_alloc in &ops {
+                if *do_alloc {
+                    // Alloc 1 block
+                    if let Ok(a) = alloc_blocks(&cx, &dev, &geo, &mut groups, 1, &AllocHint::default()) {
+                        net_allocated += a.count;
+                        allocated.push(a);
+                    }
+                } else if let Some(a) = allocated.pop() {
+                    // Free last allocated block
+                    free_blocks(&cx, &dev, &geo, &mut groups, a.start, a.count).unwrap();
+                    net_allocated -= a.count;
+                }
+
+                // Invariant: current free = original - net_allocated
+                let current_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
+                prop_assert_eq!(
+                    current_free, original_free - net_allocated,
+                    "free count mismatch after op"
+                );
+            }
+        }
+
+        // ── Succinct bitmap properties ──────────────────────────────
+
+        /// SuccinctBitmap rank0 + rank1 = position for all valid positions.
+        #[test]
+        fn proptest_succinct_rank_sum(
+            (ref bm, count) in bitmap_strat(),
+        ) {
+            let sb = succinct::SuccinctBitmap::build(bm, count);
+            // Check at a few positions within the range.
+            for pos in [0, count / 4, count / 2, count.saturating_sub(1), count] {
+                if pos <= count {
+                    let r0 = sb.rank0(pos);
+                    let r1 = sb.rank1(pos);
+                    prop_assert_eq!(
+                        r0 + r1, pos,
+                        "rank0({}) + rank1({}) = {} != {}",
+                        pos, pos, r0 + r1, pos,
+                    );
+                }
+            }
+        }
+
+        /// SuccinctBitmap total ones matches manual popcount.
+        #[test]
+        fn proptest_succinct_ones_matches_popcount(
+            (ref bm, count) in bitmap_strat(),
+        ) {
+            let sb = succinct::SuccinctBitmap::build(bm, count);
+            let manual_ones = (0..count).filter(|&i| bitmap_get(bm, i)).count();
+            prop_assert_eq!(
+                sb.count_ones() as usize, manual_ones,
+                "SuccinctBitmap.count_ones() mismatch"
+            );
+        }
+
+        /// SuccinctBitmap select0 returns a valid zero-bit position.
+        #[test]
+        fn proptest_succinct_select0_valid(
+            (ref bm, count) in bitmap_strat(),
+        ) {
+            let sb = succinct::SuccinctBitmap::build(bm, count);
+            let zeros = sb.count_zeros();
+            if zeros > 0 {
+                // Check first and last zero.
+                if let Some(pos) = sb.select0(0) {
+                    prop_assert!(pos < count, "select0(0) = {} >= count {}", pos, count);
+                    prop_assert!(!bitmap_get(bm, pos), "select0(0) points to a set bit");
+                }
+                if let Some(pos) = sb.select0(zeros - 1) {
+                    prop_assert!(pos < count, "select0(last) = {} >= count", pos);
+                    prop_assert!(!bitmap_get(bm, pos), "select0(last) points to a set bit");
+                }
+            }
+            // select0 beyond zeros count returns None.
+            prop_assert_eq!(sb.select0(zeros), None);
+        }
+
+        /// SuccinctBitmap select1 returns a valid one-bit position.
+        #[test]
+        fn proptest_succinct_select1_valid(
+            (ref bm, count) in bitmap_strat(),
+        ) {
+            let sb = succinct::SuccinctBitmap::build(bm, count);
+            let ones = sb.count_ones();
+            if ones > 0 {
+                if let Some(pos) = sb.select1(0) {
+                    prop_assert!(pos < count);
+                    prop_assert!(bitmap_get(bm, pos), "select1(0) points to a zero bit");
+                }
+                if let Some(pos) = sb.select1(ones - 1) {
+                    prop_assert!(pos < count);
+                    prop_assert!(bitmap_get(bm, pos), "select1(last) points to a zero bit");
+                }
+            }
+            prop_assert_eq!(sb.select1(ones), None);
+        }
+
+        /// SuccinctBitmap find_free agrees with bitmap_find_free for start=0.
+        #[test]
+        fn proptest_succinct_find_free_matches_linear(
+            (ref bm, count) in bitmap_strat(),
+        ) {
+            let sb = succinct::SuccinctBitmap::build(bm, count);
+            let linear = bitmap_find_free(bm, count, 0);
+            let succinct_result = sb.find_free(0);
+            prop_assert_eq!(
+                succinct_result, linear,
+                "find_free mismatch: succinct={:?}, linear={:?}",
+                succinct_result, linear,
+            );
+        }
+
+        // ── Free blocks validation properties ───────────────────────
+
+        /// Freeing blocks at an out-of-range group returns Corruption error.
+        #[test]
+        fn proptest_free_blocks_oob_group_errors(
+            group_offset in 4_u32..100,
+        ) {
+            let cx = test_cx();
+            let dev = MemBlockDevice::new(4096);
+            let geo = make_geometry();
+            let mut groups = make_groups(&geo);
+
+            // Build an absolute block in a non-existent group.
+            let bad_start = BlockNumber(u64::from(group_offset) * u64::from(geo.blocks_per_group));
+            let result = free_blocks(&cx, &dev, &geo, &mut groups, bad_start, 1);
+            prop_assert!(result.is_err(), "free_blocks should reject out-of-range group");
+        }
+
+        /// Freeing blocks that cross group boundary returns error.
+        #[test]
+        fn proptest_free_blocks_cross_boundary_errors(
+            group_idx in 0_u32..3,
+        ) {
+            let cx = test_cx();
+            let dev = MemBlockDevice::new(4096);
+            let geo = make_geometry();
+            let mut groups = make_groups(&geo);
+
+            let blocks_in = geo.blocks_in_group(GroupNumber(group_idx));
+            // Start near end of group, count crosses boundary.
+            let rel_start = blocks_in.saturating_sub(1);
+            let abs = geo.group_block_to_absolute(GroupNumber(group_idx), rel_start);
+            let result = free_blocks(&cx, &dev, &geo, &mut groups, abs, 2);
+            prop_assert!(
+                result.is_err(),
+                "free_blocks should reject extent crossing group boundary"
+            );
+        }
     }
 }

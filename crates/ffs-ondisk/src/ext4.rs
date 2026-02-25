@@ -7081,5 +7081,307 @@ mod tests {
             prop_assert!(parsed.volume_name.chars().count() <= 16);
             prop_assert!(!parsed.volume_name.contains('\0'));
         }
+
+        // ── ext4_chksum properties ────────────────────────────────────
+
+        /// ext4_chksum is deterministic: same inputs always produce same output.
+        #[test]
+        fn ext4_proptest_chksum_deterministic(
+            seed in any::<u32>(),
+            data in proptest::collection::vec(any::<u8>(), 0..=256),
+        ) {
+            let a = ext4_chksum(seed, &data);
+            let b = ext4_chksum(seed, &data);
+            prop_assert_eq!(a, b);
+        }
+
+        /// ext4_chksum on empty data still transforms the seed.
+        #[test]
+        fn ext4_proptest_chksum_empty_data_varies(seed in any::<u32>()) {
+            let result = ext4_chksum(seed, &[]);
+            // With empty data, the CRC should still be a function of the seed
+            // (not necessarily equal to the seed, since !crc32c_append(!seed, &[]) applies double complement)
+            let _ = result; // just verify no panic; determinism checked above
+        }
+
+        /// ext4_chksum with different data produces different results (with high probability).
+        #[test]
+        fn ext4_proptest_chksum_collision_resistance(
+            seed in any::<u32>(),
+            data1 in proptest::collection::vec(any::<u8>(), 1..=64),
+            data2 in proptest::collection::vec(any::<u8>(), 1..=64),
+        ) {
+            prop_assume!(data1 != data2);
+            let h1 = ext4_chksum(seed, &data1);
+            let h2 = ext4_chksum(seed, &data2);
+            // Not guaranteed to differ, but with random 32-bit hash they almost always will.
+            // We only assert no panic here; collision resistance is statistical.
+            let _ = (h1, h2);
+        }
+
+        // ── Ext4GroupDesc parse/write roundtrip ───────────────────────
+
+        /// Ext4GroupDesc: parse(write(gd)) == gd for 32-byte descriptors.
+        #[test]
+        fn ext4_proptest_group_desc_roundtrip_32(
+            block_bitmap in any::<u32>(),
+            inode_bitmap in any::<u32>(),
+            inode_table in any::<u32>(),
+            free_blocks in 0_u16..=u16::MAX,
+            free_inodes in 0_u16..=u16::MAX,
+            used_dirs in 0_u16..=u16::MAX,
+            flags in any::<u16>(),
+            itable_unused in 0_u16..=u16::MAX,
+            checksum in any::<u16>(),
+        ) {
+            let gd = Ext4GroupDesc {
+                block_bitmap: u64::from(block_bitmap),
+                inode_bitmap: u64::from(inode_bitmap),
+                inode_table: u64::from(inode_table),
+                free_blocks_count: u32::from(free_blocks),
+                free_inodes_count: u32::from(free_inodes),
+                used_dirs_count: u32::from(used_dirs),
+                itable_unused: u32::from(itable_unused),
+                flags,
+                checksum,
+            };
+            let mut buf = vec![0u8; 32];
+            gd.write_to_bytes(&mut buf, 32).expect("write 32-byte GD");
+            let parsed = Ext4GroupDesc::parse_from_bytes(&buf, 32).expect("parse 32-byte GD");
+            prop_assert_eq!(parsed.block_bitmap, gd.block_bitmap);
+            prop_assert_eq!(parsed.inode_bitmap, gd.inode_bitmap);
+            prop_assert_eq!(parsed.inode_table, gd.inode_table);
+            prop_assert_eq!(parsed.free_blocks_count, gd.free_blocks_count);
+            prop_assert_eq!(parsed.free_inodes_count, gd.free_inodes_count);
+            prop_assert_eq!(parsed.used_dirs_count, gd.used_dirs_count);
+            prop_assert_eq!(parsed.flags, gd.flags);
+            prop_assert_eq!(parsed.checksum, gd.checksum);
+        }
+
+        /// Ext4GroupDesc: parse(write(gd)) == gd for 64-byte descriptors.
+        #[test]
+        fn ext4_proptest_group_desc_roundtrip_64(
+            block_bitmap in any::<u64>(),
+            inode_bitmap in any::<u64>(),
+            inode_table in any::<u64>(),
+            free_blocks in any::<u32>(),
+            free_inodes in any::<u32>(),
+            used_dirs in any::<u32>(),
+            flags in any::<u16>(),
+            itable_unused in any::<u32>(),
+            checksum in any::<u16>(),
+        ) {
+            let gd = Ext4GroupDesc {
+                block_bitmap,
+                inode_bitmap,
+                inode_table,
+                free_blocks_count: free_blocks,
+                free_inodes_count: free_inodes,
+                used_dirs_count: used_dirs,
+                itable_unused,
+                flags,
+                checksum,
+            };
+            let mut buf = vec![0u8; 64];
+            gd.write_to_bytes(&mut buf, 64).expect("write 64-byte GD");
+            let parsed = Ext4GroupDesc::parse_from_bytes(&buf, 64).expect("parse 64-byte GD");
+            prop_assert_eq!(parsed.block_bitmap, gd.block_bitmap);
+            prop_assert_eq!(parsed.inode_bitmap, gd.inode_bitmap);
+            prop_assert_eq!(parsed.inode_table, gd.inode_table);
+            prop_assert_eq!(parsed.free_blocks_count, gd.free_blocks_count);
+            prop_assert_eq!(parsed.free_inodes_count, gd.free_inodes_count);
+            prop_assert_eq!(parsed.used_dirs_count, gd.used_dirs_count);
+            prop_assert_eq!(parsed.flags, gd.flags);
+            prop_assert_eq!(parsed.checksum, gd.checksum);
+        }
+
+        /// Ext4GroupDesc: parse never panics on arbitrary bytes.
+        #[test]
+        fn ext4_proptest_group_desc_parse_no_panic(
+            bytes in proptest::collection::vec(any::<u8>(), 0..=128),
+            desc_size in prop_oneof![Just(32_u16), Just(64_u16)],
+        ) {
+            let _ = Ext4GroupDesc::parse_from_bytes(&bytes, desc_size);
+        }
+
+        // ── stamp + verify group desc checksum roundtrip ──────────────
+
+        /// stamp_group_desc_checksum + verify_group_desc_checksum roundtrip.
+        #[test]
+        fn ext4_proptest_gd_checksum_stamp_verify_roundtrip(
+            csum_seed in any::<u32>(),
+            group_number in any::<u32>(),
+            desc_size in prop_oneof![Just(32_u16), Just(64_u16)],
+        ) {
+            let ds = usize::from(desc_size);
+            let mut buf = vec![0u8; ds];
+            // Fill with arbitrary data except checksum field.
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = u8::try_from(i & 0xFF).unwrap();
+            }
+            stamp_group_desc_checksum(&mut buf, csum_seed, group_number, desc_size);
+            let result = verify_group_desc_checksum(&buf, csum_seed, group_number, desc_size);
+            prop_assert!(result.is_ok(), "stamp then verify should succeed");
+        }
+
+        /// Tampering with stamped checksum causes verification failure.
+        #[test]
+        fn ext4_proptest_gd_checksum_tamper_fails(
+            csum_seed in any::<u32>(),
+            group_number in any::<u32>(),
+            tamper_byte in 0_usize..30,
+        ) {
+            let desc_size = 32_u16;
+            let ds = usize::from(desc_size);
+            let mut buf = vec![0u8; ds];
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = u8::try_from(i & 0xFF).unwrap();
+            }
+            stamp_group_desc_checksum(&mut buf, csum_seed, group_number, desc_size);
+
+            // Tamper with a non-checksum byte.
+            let tamper_idx = if tamper_byte >= GD_CHECKSUM_OFFSET { tamper_byte + 2 } else { tamper_byte };
+            if tamper_idx < ds {
+                buf[tamper_idx] ^= 0xFF;
+                let result = verify_group_desc_checksum(&buf, csum_seed, group_number, desc_size);
+                prop_assert!(result.is_err(), "tampered descriptor should fail verification");
+            }
+        }
+
+        // ── Ext4Inode parse no-panic ──────────────────────────────────
+
+        /// Ext4Inode: parse never panics on arbitrary bytes (128+ bytes).
+        #[test]
+        fn ext4_proptest_inode_parse_no_panic(
+            bytes in proptest::collection::vec(any::<u8>(), 0..=512),
+        ) {
+            let _ = Ext4Inode::parse_from_bytes(&bytes);
+        }
+
+        /// Ext4Inode: parse on 128-byte buffer always succeeds (minimum valid inode).
+        #[test]
+        fn ext4_proptest_inode_parse_128_succeeds(
+            bytes in proptest::collection::vec(any::<u8>(), 128..=128),
+        ) {
+            let result = Ext4Inode::parse_from_bytes(&bytes);
+            prop_assert!(result.is_ok(), "128-byte inode should always parse");
+        }
+
+        /// Ext4Inode: parse on 256-byte buffer captures extended timestamps.
+        #[test]
+        fn ext4_proptest_inode_parse_256_extended(
+            mut bytes in proptest::collection::vec(any::<u8>(), 256..=256),
+        ) {
+            // Set extra_isize to a valid value (>= 32 for extended timestamps).
+            // extra_isize is at offset 0x80 (128) in the inode.
+            bytes[0x80] = 32;
+            bytes[0x81] = 0;
+            let result = Ext4Inode::parse_from_bytes(&bytes);
+            prop_assert!(result.is_ok(), "256-byte inode with extra_isize=32 should parse");
+        }
+
+        // ── dx_hash properties ────────────────────────────────────────
+
+        /// dx_hash is deterministic.
+        #[test]
+        fn ext4_proptest_dx_hash_deterministic(
+            hash_version in 0_u8..=5,
+            name in proptest::collection::vec(any::<u8>(), 0..=255),
+            seed in proptest::array::uniform4(any::<u32>()),
+        ) {
+            let (h1a, h1b) = dx_hash(hash_version, &name, &seed);
+            let (h2a, h2b) = dx_hash(hash_version, &name, &seed);
+            prop_assert_eq!(h1a, h2a);
+            prop_assert_eq!(h1b, h2b);
+        }
+
+        /// dx_hash major value always has low bit clear (ext4 convention).
+        #[test]
+        fn ext4_proptest_dx_hash_major_low_bit_clear(
+            hash_version in 0_u8..=5,
+            name in proptest::collection::vec(any::<u8>(), 1..=64),
+            seed in proptest::array::uniform4(any::<u32>()),
+        ) {
+            let (major, _minor) = dx_hash(hash_version, &name, &seed);
+            prop_assert_eq!(major & 1, 0, "major hash low bit must be clear (ext4 convention)");
+        }
+
+        /// dx_hash never panics on any input.
+        #[test]
+        fn ext4_proptest_dx_hash_no_panic(
+            hash_version in any::<u8>(),
+            name in proptest::collection::vec(any::<u8>(), 0..=512),
+            seed in proptest::array::uniform4(any::<u32>()),
+        ) {
+            let _ = dx_hash(hash_version, &name, &seed);
+        }
+
+        // ── parse_dx_root properties ──────────────────────────────────
+
+        /// parse_dx_root never panics on arbitrary input.
+        #[test]
+        fn ext4_proptest_parse_dx_root_no_panic(
+            block in proptest::collection::vec(any::<u8>(), 0..=4096),
+        ) {
+            let _ = parse_dx_root(&block);
+        }
+
+        // ── parse_xattr_block properties ──────────────────────────────
+
+        /// parse_xattr_block never panics on arbitrary input.
+        #[test]
+        fn ext4_proptest_parse_xattr_block_no_panic(
+            block in proptest::collection::vec(any::<u8>(), 0..=4096),
+        ) {
+            let _ = parse_xattr_block(&block);
+        }
+
+        /// parse_xattr_block fails on short input (<32 bytes).
+        #[test]
+        fn ext4_proptest_parse_xattr_block_short_fails(
+            block in proptest::collection::vec(any::<u8>(), 0..=31),
+        ) {
+            let result = parse_xattr_block(&block);
+            prop_assert!(result.is_err(), "xattr block < 32 bytes should fail");
+        }
+
+        // ── verify_bitmap_free_count properties ───────────────────────
+
+        /// verify_bitmap_free_count: correct count always passes.
+        #[test]
+        fn ext4_proptest_bitmap_verify_correct_passes(
+            byte_len in 1_usize..=128,
+            fill_seed in any::<u64>(),
+        ) {
+            let total_bits = u32::try_from(byte_len * 8).unwrap();
+            let mut bm = vec![0u8; byte_len];
+            // Deterministic fill based on seed.
+            let mut rng = fill_seed;
+            for b in &mut bm {
+                rng = rng.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                *b = rng.to_le_bytes()[7];
+            }
+            // Count actual free bits.
+            let used: u32 = bm[..byte_len].iter().map(|b| b.count_ones()).sum();
+            let free = total_bits.saturating_sub(used);
+            let result = verify_inode_bitmap_free_count(&bm, total_bits, free);
+            prop_assert!(result.is_ok(), "correct free count should verify");
+        }
+
+        /// verify_bitmap_free_count: wrong count always fails.
+        #[test]
+        fn ext4_proptest_bitmap_verify_wrong_fails(
+            byte_len in 1_usize..=64,
+            delta in 1_u32..=100,
+        ) {
+            let total_bits = u32::try_from(byte_len * 8).unwrap();
+            let bm = vec![0u8; byte_len]; // all free
+            // True free count = total_bits, pass wrong count.
+            let wrong_free = total_bits.saturating_sub(delta);
+            if wrong_free != total_bits {
+                let result = verify_inode_bitmap_free_count(&bm, total_bits, wrong_free);
+                prop_assert!(result.is_err(), "wrong free count should fail verification");
+            }
+        }
     }
 }

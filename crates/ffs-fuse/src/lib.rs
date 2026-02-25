@@ -3431,4 +3431,468 @@ mod tests {
         // Second take should return None (consumed).
         assert_eq!(manager.take(ino, 0, 4), None);
     }
+
+    // ── Proptest property-based tests ─────────────────────────────────────
+
+    #[expect(clippy::cast_possible_truncation)] // test-only: proptest ranges guarantee safe casts
+    mod proptests {
+        use super::*;
+        use crate::per_core::{
+            CoreMetrics, PerCoreConfig, PerCoreDispatcher, inode_to_core, lookup_to_core,
+        };
+        use proptest::prelude::*;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            // ── inode_to_core properties ────────────────────────────────
+
+            /// Routing is always deterministic: same inputs produce same output.
+            #[test]
+            fn inode_routing_is_deterministic(ino in 0_u64..=u64::MAX, cores in 1_u32..=256) {
+                let a = inode_to_core(ino, cores);
+                let b = inode_to_core(ino, cores);
+                prop_assert_eq!(a, b);
+            }
+
+            /// Routing output is always within [0, num_cores).
+            #[test]
+            fn inode_routing_in_range(ino in 0_u64..=u64::MAX, cores in 1_u32..=256) {
+                let core = inode_to_core(ino, cores);
+                prop_assert!(core < cores, "core {core} >= num_cores {cores}");
+            }
+
+            /// Routing with num_cores=0 always returns 0.
+            #[test]
+            fn inode_routing_zero_cores_always_zero(ino in 0_u64..=u64::MAX) {
+                prop_assert_eq!(inode_to_core(ino, 0), 0);
+            }
+
+            /// With 1 core, every inode routes to core 0.
+            #[test]
+            fn inode_routing_single_core(ino in 0_u64..=u64::MAX) {
+                prop_assert_eq!(inode_to_core(ino, 1), 0);
+            }
+
+            /// lookup_to_core delegates to inode_to_core on parent.
+            #[test]
+            fn lookup_routes_same_as_inode(parent in 0_u64..=u64::MAX, cores in 1_u32..=256) {
+                prop_assert_eq!(
+                    lookup_to_core(parent, cores),
+                    inode_to_core(parent, cores)
+                );
+            }
+
+            // ── classify_xattr_reply properties ────────────────────────
+
+            /// size=0 always produces Size variant (probe mode).
+            #[test]
+            fn xattr_probe_always_returns_size(payload_len in 0_usize..=u32::MAX as usize) {
+                let plan = FrankenFuse::classify_xattr_reply(0, payload_len);
+                match plan {
+                    XattrReplyPlan::Size(n) => {
+                        prop_assert_eq!(n, u32::try_from(payload_len).unwrap());
+                    }
+                    _ => prop_assert!(false, "expected Size variant, got {plan:?}"),
+                }
+            }
+
+            /// When buffer fits (payload <= size), always produces Data.
+            #[test]
+            fn xattr_data_when_fits(
+                size in 1_u32..=u32::MAX,
+                payload_len in 0_u32..=u32::MAX,
+            ) {
+                // Only test when payload_len <= size
+                if payload_len <= size {
+                    let plan = FrankenFuse::classify_xattr_reply(size, payload_len as usize);
+                    prop_assert_eq!(plan, XattrReplyPlan::Data);
+                }
+            }
+
+            /// When buffer too small (payload > size > 0), produces ERANGE.
+            #[test]
+            fn xattr_erange_when_too_small(
+                size in 1_u32..=u32::MAX - 1,
+                extra in 1_u32..=1024,
+            ) {
+                let payload_len = (u64::from(size) + u64::from(extra)).min(u64::from(u32::MAX)) as usize;
+                if payload_len > usize::try_from(size).unwrap() {
+                    let plan = FrankenFuse::classify_xattr_reply(size, payload_len);
+                    prop_assert_eq!(plan, XattrReplyPlan::Error(libc::ERANGE));
+                }
+            }
+
+            // ── parse_setxattr_mode properties ─────────────────────────
+
+            /// Valid flags (0, CREATE, REPLACE) with position=0 always succeed.
+            #[test]
+            fn setxattr_valid_flags_succeed(flag in prop_oneof![
+                Just(0_i32),
+                Just(XATTR_FLAG_CREATE),
+                Just(XATTR_FLAG_REPLACE),
+            ]) {
+                prop_assert!(FrankenFuse::parse_setxattr_mode(flag, 0).is_ok());
+            }
+
+            /// Non-zero position always fails with EINVAL.
+            #[test]
+            fn setxattr_nonzero_position_fails(flags in 0_i32..=3, position in 1_u32..=u32::MAX) {
+                let result = FrankenFuse::parse_setxattr_mode(flags, position);
+                prop_assert_eq!(result, Err(libc::EINVAL));
+            }
+
+            /// Unknown flags (bits outside CREATE|REPLACE) always fail.
+            #[test]
+            fn setxattr_unknown_flags_fail(unknown_bits in 4_i32..=i32::MAX) {
+                // Ensure at least one bit outside the known mask is set.
+                let known = XATTR_FLAG_CREATE | XATTR_FLAG_REPLACE;
+                if unknown_bits & !known != 0 {
+                    let result = FrankenFuse::parse_setxattr_mode(unknown_bits, 0);
+                    prop_assert_eq!(result, Err(libc::EINVAL));
+                }
+            }
+
+            /// CREATE|REPLACE together always fail.
+            #[test]
+            fn setxattr_create_and_replace_fail(_dummy in 0_u8..1) {
+                let result = FrankenFuse::parse_setxattr_mode(
+                    XATTR_FLAG_CREATE | XATTR_FLAG_REPLACE, 0
+                );
+                prop_assert_eq!(result, Err(libc::EINVAL));
+            }
+
+            // ── encode_xattr_names properties ──────────────────────────
+
+            /// Encoded output length = sum(name.len() + 1) for each name.
+            #[test]
+            fn xattr_encode_length_property(
+                names in prop::collection::vec("[a-z]{1,20}", 0..10)
+            ) {
+                let encoded = FrankenFuse::encode_xattr_names(&names);
+                let expected_len: usize = names.iter().map(|n| n.len() + 1).sum();
+                prop_assert_eq!(encoded.len(), expected_len);
+            }
+
+            /// Each encoded name ends with NUL separator.
+            #[test]
+            fn xattr_encode_nul_separated(
+                names in prop::collection::vec("[a-z]{1,20}", 1..10)
+            ) {
+                let encoded = FrankenFuse::encode_xattr_names(&names);
+                if !encoded.is_empty() {
+                    prop_assert_eq!(*encoded.last().unwrap(), 0_u8);
+                }
+                // Count NUL bytes = number of names.
+                #[expect(clippy::naive_bytecount)] // test: bytecount crate not warranted
+                let nul_count = encoded.iter().filter(|&&b| b == 0).count();
+                prop_assert_eq!(nul_count, names.len());
+            }
+
+            // ── AccessPredictor properties ──────────────────────────────
+
+            /// History never exceeds max_entries.
+            #[test]
+            fn access_predictor_bounded_history(
+                max_entries in 1_usize..=16,
+                num_reads in 1_usize..=64,
+            ) {
+                let predictor = AccessPredictor::new(max_entries);
+                for i in 0..u64::try_from(num_reads).unwrap() {
+                    predictor.record_read(InodeNumber(i), 0, 4096);
+                }
+                let count = match predictor.state.lock() {
+                    Ok(guard) => guard.history.len(),
+                    Err(poisoned) => poisoned.into_inner().history.len(),
+                };
+                prop_assert!(count <= max_entries, "history {count} > max {max_entries}");
+            }
+
+            /// Fetch size for unknown inode equals requested size.
+            #[test]
+            fn access_predictor_unknown_inode_returns_requested(
+                ino in 0_u64..=u64::MAX,
+                offset in 0_u64..=u64::MAX,
+                size in 1_u32..=65536,
+            ) {
+                let predictor = AccessPredictor::new(16);
+                prop_assert_eq!(predictor.fetch_size(InodeNumber(ino), offset, size), size);
+            }
+
+            /// Zero-size reads are silently dropped (no state mutation).
+            #[test]
+            fn access_predictor_zero_size_read_is_noop(ino in 0_u64..=1000) {
+                let predictor = AccessPredictor::new(16);
+                predictor.record_read(InodeNumber(ino), 0, 0);
+                let count = match predictor.state.lock() {
+                    Ok(guard) => guard.history.len(),
+                    Err(poisoned) => poisoned.into_inner().history.len(),
+                };
+                prop_assert_eq!(count, 0);
+            }
+
+            /// Coalesced fetch size is always >= requested size.
+            #[test]
+            fn access_predictor_fetch_at_least_requested(
+                offset in 0_u64..=1_000_000,
+                size in 1_u32..=65536,
+            ) {
+                let predictor = AccessPredictor::new(64);
+                let ino = InodeNumber(42);
+                // Build some sequential history.
+                for i in 0..5_u64 {
+                    predictor.record_read(ino, i * u64::from(size), size);
+                }
+                let fetch = predictor.fetch_size(ino, offset, size);
+                prop_assert!(fetch >= size, "fetch {fetch} < requested {size}");
+            }
+
+            /// Coalesced fetch size never exceeds MAX_COALESCED_READ_SIZE.
+            #[test]
+            fn access_predictor_fetch_capped(size in 1_u32..=65536) {
+                let predictor = AccessPredictor::new(64);
+                let ino = InodeNumber(99);
+                // Build long forward sequence.
+                for i in 0..20_u64 {
+                    predictor.record_read(ino, i * u64::from(size), size);
+                }
+                let next_offset = 20 * u64::from(size);
+                let fetch = predictor.fetch_size(ino, next_offset, size);
+                prop_assert!(
+                    fetch <= MAX_COALESCED_READ_SIZE.max(size),
+                    "fetch {fetch} > cap {}",
+                    MAX_COALESCED_READ_SIZE.max(size)
+                );
+            }
+
+            // ── ReadaheadManager properties ─────────────────────────────
+
+            /// insert then take at same offset returns the data.
+            #[test]
+            fn readahead_insert_take_roundtrip(
+                ino in 1_u64..=1000,
+                offset in 0_u64..=1_000_000,
+                data in prop::collection::vec(any::<u8>(), 1..128),
+            ) {
+                let manager = ReadaheadManager::new(64);
+                let data_clone = data.clone();
+                manager.insert(InodeNumber(ino), offset, data);
+                let taken = manager.take(InodeNumber(ino), offset, data_clone.len());
+                prop_assert_eq!(taken, Some(data_clone));
+            }
+
+            /// take after consume returns None.
+            #[test]
+            fn readahead_double_take_returns_none(
+                ino in 1_u64..=1000,
+                offset in 0_u64..=1_000_000,
+                data in prop::collection::vec(any::<u8>(), 1..64),
+            ) {
+                let manager = ReadaheadManager::new(64);
+                let len = data.len();
+                manager.insert(InodeNumber(ino), offset, data);
+                let _ = manager.take(InodeNumber(ino), offset, len);
+                let second = manager.take(InodeNumber(ino), offset, len);
+                prop_assert_eq!(second, None);
+            }
+
+            /// Pending entries never exceed max_pending.
+            #[test]
+            fn readahead_bounded_entries(
+                max_pending in 1_usize..=8,
+                num_inserts in 1_usize..=32,
+            ) {
+                let manager = ReadaheadManager::new(max_pending);
+                for i in 0..u64::try_from(num_inserts).unwrap() {
+                    manager.insert(InodeNumber(1), i * 1024, vec![0xAA]);
+                }
+                let count = match manager.pending.lock() {
+                    Ok(guard) => guard.map.len(),
+                    Err(poisoned) => poisoned.into_inner().map.len(),
+                };
+                prop_assert!(count <= max_pending, "entries {count} > max {max_pending}");
+            }
+
+            /// Empty data insertions are silently ignored.
+            #[test]
+            fn readahead_empty_insert_ignored(ino in 1_u64..=100, offset in 0_u64..=1000) {
+                let manager = ReadaheadManager::new(8);
+                manager.insert(InodeNumber(ino), offset, vec![]);
+                let count = match manager.pending.lock() {
+                    Ok(guard) => guard.map.len(),
+                    Err(poisoned) => poisoned.into_inner().map.len(),
+                };
+                prop_assert_eq!(count, 0);
+            }
+
+            /// Partial take returns prefix and preserves tail at correct offset.
+            #[test]
+            fn readahead_partial_take_preserves_tail(
+                data in prop::collection::vec(any::<u8>(), 4..128),
+                take_len in 1_usize..=3,
+            ) {
+                let manager = ReadaheadManager::new(16);
+                let ino = InodeNumber(7);
+                let offset = 0_u64;
+                let data_clone = data.clone();
+                let actual_take = take_len.min(data.len() - 1); // Ensure a tail exists.
+                if actual_take < data.len() {
+                    manager.insert(ino, offset, data);
+                    let prefix = manager.take(ino, offset, actual_take);
+                    prop_assert_eq!(prefix.as_deref(), Some(&data_clone[..actual_take]));
+
+                    // Tail should be at offset + actual_take.
+                    let tail_offset = offset + u64::try_from(actual_take).unwrap();
+                    let tail = manager.take(ino, tail_offset, data_clone.len());
+                    prop_assert_eq!(tail.as_deref(), Some(&data_clone[actual_take..]));
+                }
+            }
+
+            // ── AtomicMetrics properties ────────────────────────────────
+
+            /// ok + err always equals total.
+            #[test]
+            fn metrics_ok_plus_err_equals_total(
+                num_ok in 0_u64..=500,
+                num_err in 0_u64..=500,
+            ) {
+                let metrics = AtomicMetrics::new();
+                for _ in 0..num_ok { metrics.record_ok(); }
+                for _ in 0..num_err { metrics.record_err(); }
+                let snap = metrics.snapshot();
+                prop_assert_eq!(snap.requests_ok, num_ok);
+                prop_assert_eq!(snap.requests_err, num_err);
+                prop_assert_eq!(snap.requests_total, num_ok + num_err);
+            }
+
+            /// bytes_read accumulates correctly.
+            #[test]
+            fn metrics_bytes_read_accumulates(
+                reads in prop::collection::vec(1_u64..=8192, 0..50),
+            ) {
+                let metrics = AtomicMetrics::new();
+                let expected: u64 = reads.iter().sum();
+                for &n in &reads {
+                    metrics.record_bytes_read(n);
+                }
+                prop_assert_eq!(metrics.snapshot().bytes_read, expected);
+            }
+
+            // ── MountOptions properties ─────────────────────────────────
+
+            /// Resolved thread count is always >= 1.
+            #[test]
+            fn mount_options_resolved_at_least_one(threads in 0_usize..=256) {
+                let opts = MountOptions {
+                    worker_threads: threads,
+                    ..Default::default()
+                };
+                prop_assert!(opts.resolved_thread_count() >= 1);
+            }
+
+            /// Explicit worker_threads passes through (when > 0).
+            #[test]
+            fn mount_options_explicit_passthrough(threads in 1_usize..=256) {
+                let opts = MountOptions {
+                    worker_threads: threads,
+                    ..Default::default()
+                };
+                prop_assert_eq!(opts.resolved_thread_count(), threads);
+            }
+
+            // ── PerCoreConfig properties ────────────────────────────────
+
+            /// total_cache_blocks = resolved_cores * cache_blocks_per_core.
+            #[test]
+            fn per_core_total_cache_blocks(
+                cores in 1_u32..=16,
+                blocks_per_core in 1_u32..=65536,
+            ) {
+                let cfg = PerCoreConfig {
+                    num_cores: cores,
+                    cache_blocks_per_core: blocks_per_core,
+                    steal_threshold: 2.0,
+                    advisory_affinity: true,
+                };
+                prop_assert_eq!(
+                    cfg.total_cache_blocks(),
+                    u64::from(cores) * u64::from(blocks_per_core)
+                );
+            }
+
+            /// PerCoreDispatcher has exactly num_cores metrics slots.
+            #[test]
+            fn dispatcher_correct_num_metrics(cores in 1_u32..=16) {
+                let cfg = PerCoreConfig {
+                    num_cores: cores,
+                    ..Default::default()
+                };
+                let disp = PerCoreDispatcher::new(cfg);
+                prop_assert_eq!(disp.num_cores(), cores);
+                for c in 0..cores {
+                    prop_assert!(disp.core_metrics(c).is_some());
+                }
+                prop_assert!(disp.core_metrics(cores).is_none());
+            }
+
+            /// Aggregate total_requests = sum of per-core requests.
+            #[test]
+            fn dispatcher_aggregate_sums(
+                per_core_counts in prop::collection::vec(0_u64..=1000, 2..=8),
+            ) {
+                let n = per_core_counts.len() as u32;
+                let cfg = PerCoreConfig {
+                    num_cores: n,
+                    ..Default::default()
+                };
+                let disp = PerCoreDispatcher::new(cfg);
+                let mut expected_total = 0_u64;
+                for (i, &count) in per_core_counts.iter().enumerate() {
+                    let m = disp.core_metrics(i as u32).unwrap();
+                    for _ in 0..count {
+                        m.record_request();
+                    }
+                    expected_total += count;
+                }
+                let agg = disp.aggregate_metrics();
+                prop_assert_eq!(agg.total_requests, expected_total);
+                prop_assert_eq!(agg.per_core.len(), n as usize);
+            }
+
+            /// Hit rate is in [0.0, 1.0] range.
+            #[test]
+            fn core_metrics_hit_rate_bounded(
+                hits in 0_u64..=1000,
+                misses in 0_u64..=1000,
+            ) {
+                let m = CoreMetrics::new();
+                for _ in 0..hits { m.record_hit(); }
+                for _ in 0..misses { m.record_miss(); }
+                let rate = m.snapshot().hit_rate();
+                prop_assert!((0.0..=1.0).contains(&rate), "hit_rate {rate} out of bounds");
+            }
+
+            /// Imbalance ratio >= 1.0 (or infinity if min is zero).
+            #[test]
+            fn dispatcher_imbalance_ratio_at_least_one(
+                per_core_counts in prop::collection::vec(0_u64..=1000, 2..=8),
+            ) {
+                let n = per_core_counts.len() as u32;
+                let cfg = PerCoreConfig {
+                    num_cores: n,
+                    ..Default::default()
+                };
+                let disp = PerCoreDispatcher::new(cfg);
+                for (i, &count) in per_core_counts.iter().enumerate() {
+                    let m = disp.core_metrics(i as u32).unwrap();
+                    for _ in 0..count {
+                        m.record_request();
+                    }
+                }
+                let ratio = disp.aggregate_metrics().imbalance_ratio();
+                prop_assert!(ratio >= 1.0 || ratio.is_infinite(),
+                    "imbalance_ratio {ratio} < 1.0");
+            }
+        }
+    }
 }
