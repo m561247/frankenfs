@@ -2008,5 +2008,126 @@ mod tests {
                 }
             }
         }
+
+        /// GroupStats flag methods correctly detect UNINIT flags.
+        #[test]
+        fn proptest_groupstats_uninit_flags(flags in any::<u16>()) {
+            let gs = GroupStats {
+                group: GroupNumber(0),
+                free_blocks: 100,
+                free_inodes: 100,
+                used_dirs: 0,
+                block_bitmap_block: BlockNumber(1),
+                inode_bitmap_block: BlockNumber(2),
+                inode_table_block: BlockNumber(3),
+                flags,
+            };
+            prop_assert_eq!(gs.block_bitmap_uninit(), flags & GD_FLAG_BLOCK_UNINIT != 0);
+            prop_assert_eq!(gs.inode_bitmap_uninit(), flags & GD_FLAG_INODE_UNINIT != 0);
+        }
+
+        /// Alloc fails with NoSpace when all groups are completely full.
+        #[test]
+        fn proptest_alloc_fails_when_all_full(
+            block_count in 1_u32..8,
+        ) {
+            let cx = test_cx();
+            let dev = MemBlockDevice::new(4096);
+            let geo = make_geometry();
+            let mut groups: Vec<GroupStats> = (0..geo.group_count)
+                .map(|g| GroupStats {
+                    group: GroupNumber(g),
+                    free_blocks: 0,
+                    free_inodes: 0,
+                    used_dirs: 100,
+                    block_bitmap_block: BlockNumber(u64::from(g) * 100 + 1),
+                    inode_bitmap_block: BlockNumber(u64::from(g) * 100 + 2),
+                    inode_table_block: BlockNumber(u64::from(g) * 100 + 3),
+                    flags: 0,
+                })
+                .collect();
+
+            let result = alloc_blocks(
+                &cx, &dev, &geo, &mut groups, block_count, &AllocHint::default(),
+            );
+            prop_assert!(result.is_err(), "alloc should fail when all groups are full");
+        }
+
+        /// Inode alloc fails when all inodes exhausted.
+        #[test]
+        fn proptest_inode_alloc_fails_when_exhausted(is_dir in any::<bool>()) {
+            let cx = test_cx();
+            let dev = MemBlockDevice::new(4096);
+            let geo = make_geometry();
+            let mut groups: Vec<GroupStats> = (0..geo.group_count)
+                .map(|g| GroupStats {
+                    group: GroupNumber(g),
+                    free_blocks: 1000,
+                    free_inodes: 0,
+                    used_dirs: 100,
+                    block_bitmap_block: BlockNumber(u64::from(g) * 100 + 1),
+                    inode_bitmap_block: BlockNumber(u64::from(g) * 100 + 2),
+                    inode_table_block: BlockNumber(u64::from(g) * 100 + 3),
+                    flags: 0,
+                })
+                .collect();
+
+            let result = alloc_inode(
+                &cx, &dev, &geo, &mut groups, GroupNumber(0), is_dir,
+            );
+            prop_assert!(result.is_err(), "inode alloc should fail when all inodes exhausted");
+        }
+
+        /// Bitmap with all bits set: find_free returns None.
+        #[test]
+        fn proptest_bitmap_full_find_free_none(
+            byte_len in 1_usize..64,
+            start_seed in any::<u32>(),
+        ) {
+            let total_bits =
+                u32::try_from(byte_len * 8).expect("byte_len bound keeps bit length within u32");
+            let bm = vec![0xFF_u8; byte_len];
+            let start = start_seed % total_bits;
+            prop_assert_eq!(bitmap_find_free(&bm, total_bits, start), None);
+            prop_assert_eq!(bitmap_count_free(&bm, total_bits), 0);
+        }
+
+        /// Bitmap with all bits clear: find_free returns start (no wrap needed).
+        #[test]
+        fn proptest_bitmap_empty_find_free_at_start(
+            byte_len in 1_usize..64,
+            start_seed in any::<u32>(),
+        ) {
+            let total_bits =
+                u32::try_from(byte_len * 8).expect("byte_len bound keeps bit length within u32");
+            let bm = vec![0_u8; byte_len];
+            let start = start_seed % total_bits;
+            prop_assert_eq!(bitmap_find_free(&bm, total_bits, start), Some(start));
+            prop_assert_eq!(bitmap_count_free(&bm, total_bits), total_bits);
+        }
+
+        /// AllocHint goal_group is respected when the group has free space.
+        #[test]
+        fn proptest_alloc_respects_goal_group(
+            goal_group in 0_u32..4,
+        ) {
+            let cx = test_cx();
+            let dev = MemBlockDevice::new(4096);
+            let geo = make_geometry();
+            let mut groups = make_groups(&geo);
+
+            let hint = AllocHint {
+                goal_group: Some(GroupNumber(goal_group)),
+                ..AllocHint::default()
+            };
+
+            let alloc = alloc_blocks(&cx, &dev, &geo, &mut groups, 1, &hint).unwrap();
+            let (allocated_group, _) = geo.absolute_to_group_block(alloc.start);
+            prop_assert_eq!(
+                allocated_group.0, goal_group,
+                "allocation should land in goal group {} but landed in {}",
+                goal_group, allocated_group.0,
+            );
+        }
     }
 }
