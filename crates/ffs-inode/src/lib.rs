@@ -1316,4 +1316,139 @@ mod tests {
         assert_eq!(ino2, ino1, "should reuse the freed inode number");
         assert_eq!(inode2.generation, 2, "reuse: 1 → 2");
     }
+
+    // ── Proptest property-based tests ─────────────────────────────────
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// encode_extra_timestamp preserves epoch bits (lower 2 bits of secs >> 32).
+        #[test]
+        fn proptest_encode_extra_timestamp_epoch_bits(
+            secs in 0_u64..=0x3_FFFF_FFFF_u64,
+            nsec in 0_u32..1_000_000_000,
+        ) {
+            let extra = encode_extra_timestamp(secs, nsec);
+            let epoch = ((secs >> 32) & 0x3) as u32;
+            prop_assert_eq!(extra & 0x3, epoch, "epoch bits mismatch");
+        }
+
+        /// encode_extra_timestamp preserves nanoseconds in bits 2-31.
+        #[test]
+        fn proptest_encode_extra_timestamp_nsec_preserved(
+            secs in 0_u64..=0x3_FFFF_FFFF_u64,
+            nsec in 0_u32..1_000_000_000,
+        ) {
+            let extra = encode_extra_timestamp(secs, nsec);
+            let decoded_nsec = extra >> 2;
+            prop_assert_eq!(decoded_nsec, nsec, "nanoseconds not preserved");
+        }
+
+        /// touch_atime only modifies atime fields, not mtime/ctime.
+        #[test]
+        fn proptest_touch_atime_isolation(
+            secs in 0_u64..=0x3_FFFF_FFFF_u64,
+            nsec in 0_u32..1_000_000_000,
+        ) {
+            let mut inode = Ext4Inode {
+                mode: 0o100_644, uid: 0, gid: 0, size: 0,
+                links_count: 1, blocks: 0, flags: 0, generation: 0,
+                file_acl: 0, atime: 100, ctime: 200, mtime: 300, dtime: 0,
+                atime_extra: 0, ctime_extra: 999, mtime_extra: 888,
+                crtime: 0, crtime_extra: 0, extra_isize: 32,
+                checksum: 0, projid: 0,
+                extent_bytes: vec![0u8; 60], xattr_ibody: Vec::new(),
+            };
+
+            let orig_ctime = inode.ctime;
+            let orig_ctime_extra = inode.ctime_extra;
+            let orig_mtime = inode.mtime;
+            let orig_mtime_extra = inode.mtime_extra;
+
+            touch_atime(&mut inode, secs, nsec);
+
+            prop_assert_eq!(inode.ctime, orig_ctime, "ctime must not change");
+            prop_assert_eq!(inode.ctime_extra, orig_ctime_extra, "ctime_extra must not change");
+            prop_assert_eq!(inode.mtime, orig_mtime, "mtime must not change");
+            prop_assert_eq!(inode.mtime_extra, orig_mtime_extra, "mtime_extra must not change");
+            prop_assert_eq!(inode.atime, secs as u32, "atime lower 32 bits");
+        }
+
+        /// touch_mtime_ctime sets both mtime and ctime identically.
+        #[test]
+        fn proptest_touch_mtime_ctime_symmetric(
+            secs in 0_u64..=0x3_FFFF_FFFF_u64,
+            nsec in 0_u32..1_000_000_000,
+        ) {
+            let mut inode = Ext4Inode {
+                mode: 0o100_644, uid: 0, gid: 0, size: 0,
+                links_count: 1, blocks: 0, flags: 0, generation: 0,
+                file_acl: 0, atime: 100, ctime: 0, mtime: 0, dtime: 0,
+                atime_extra: 42, ctime_extra: 0, mtime_extra: 0,
+                crtime: 0, crtime_extra: 0, extra_isize: 32,
+                checksum: 0, projid: 0,
+                extent_bytes: vec![0u8; 60], xattr_ibody: Vec::new(),
+            };
+
+            let orig_atime = inode.atime;
+            let orig_atime_extra = inode.atime_extra;
+
+            touch_mtime_ctime(&mut inode, secs, nsec);
+
+            prop_assert_eq!(inode.mtime, inode.ctime, "mtime and ctime must be equal");
+            prop_assert_eq!(inode.mtime_extra, inode.ctime_extra, "mtime_extra and ctime_extra must be equal");
+            prop_assert_eq!(inode.atime, orig_atime, "atime must not change");
+            prop_assert_eq!(inode.atime_extra, orig_atime_extra, "atime_extra must not change");
+        }
+
+        /// serialize → parse roundtrip preserves core fields.
+        #[test]
+        fn proptest_serialize_parse_roundtrip(
+            mode_bits in 0_u16..0o7777,
+            uid in any::<u32>(),
+            gid in any::<u32>(),
+            size in 0_u64..(1_u64 << 48),
+            links_count in any::<u16>(),
+            blocks in 0_u64..(1_u64 << 48),
+            flags in any::<u32>(),
+            generation in any::<u32>(),
+        ) {
+            // Use S_IFREG so size_hi is parsed back correctly.
+            let mode = 0o100_000 | mode_bits;
+            let inode = Ext4Inode {
+                mode, uid, gid, size, links_count, blocks, flags, generation,
+                file_acl: 0, atime: 0, ctime: 0, mtime: 0, dtime: 0,
+                atime_extra: 0, ctime_extra: 0, mtime_extra: 0,
+                crtime: 0, crtime_extra: 0, extra_isize: 32,
+                checksum: 0, projid: 0,
+                extent_bytes: vec![0u8; 60], xattr_ibody: Vec::new(),
+            };
+
+            let raw = serialize_inode(&inode, 256);
+            let parsed = Ext4Inode::parse_from_bytes(&raw).unwrap();
+
+            prop_assert_eq!(parsed.mode, mode);
+            prop_assert_eq!(parsed.uid, uid);
+            prop_assert_eq!(parsed.gid, gid);
+            prop_assert_eq!(parsed.size, size);
+            prop_assert_eq!(parsed.links_count, links_count);
+            prop_assert_eq!(parsed.blocks, blocks);
+            prop_assert_eq!(parsed.flags, flags);
+            prop_assert_eq!(parsed.generation, generation);
+        }
+
+        /// locate_inode returns None for out-of-range inodes.
+        #[test]
+        fn proptest_locate_inode_out_of_range(
+            ino_raw in 8193_u64..=100_000,
+        ) {
+            let geo = make_geometry();
+            let groups = make_groups(&geo);
+            // total_inodes = 8192, so any ino > 8192 should be out of range.
+            let result = locate_inode(InodeNumber(ino_raw), &geo, &groups);
+            prop_assert!(result.is_none(), "ino {} should be out of range", ino_raw);
+        }
+    }
 }

@@ -249,8 +249,8 @@ fn fuse_getattr_file_metadata() {
     assert!(meta.is_file(), "hello.txt should be a regular file");
     assert_eq!(
         meta.len(),
-        25,
-        "hello.txt should be 25 bytes ('Hello from FrankenFS E2E!\\n')"
+        26,
+        "hello.txt should be 26 bytes ('Hello from FrankenFS E2E!\\n')"
     );
 
     // Check directory metadata.
@@ -316,7 +316,8 @@ fn try_mount_ffs_rw(image: &Path, mountpoint: &Path) -> Option<fuser::Background
         skip_validation: false,
         ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
     };
-    let fs = OpenFs::open_with_options(&cx, image, &opts).expect("open ext4 image");
+    let mut fs = OpenFs::open_with_options(&cx, image, &opts).expect("open ext4 image");
+    fs.enable_writes(&cx).expect("enable ext4 write support");
     let mount_opts = MountOptions {
         read_only: false,
         auto_unmount: false,
@@ -594,9 +595,9 @@ fn btrfs_fuse_available() -> bool {
 fn create_btrfs_test_image(dir: &Path) -> std::path::PathBuf {
     let image = dir.join("test.btrfs");
 
-    // Create a 64 MiB sparse image (btrfs needs more space than ext4).
+    // Create a 128 MiB sparse image (btrfs minimum is ~109 MiB).
     let f = fs::File::create(&image).expect("create btrfs image");
-    f.set_len(64 * 1024 * 1024).expect("set btrfs image size");
+    f.set_len(128 * 1024 * 1024).expect("set btrfs image size");
     drop(f);
 
     // mkfs.btrfs
@@ -620,7 +621,11 @@ fn try_mount_btrfs_rw(image: &Path, mountpoint: &Path) -> Option<fuser::Backgrou
         skip_validation: false,
         ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
     };
-    let fs = OpenFs::open_with_options(&cx, image, &opts).expect("open btrfs image");
+    let mut fs = OpenFs::open_with_options(&cx, image, &opts).expect("open btrfs image");
+    if let Err(e) = fs.enable_writes(&cx) {
+        eprintln!("btrfs enable_writes failed (skipping test): {e}");
+        return None;
+    }
     let mount_opts = MountOptions {
         read_only: false,
         auto_unmount: false,

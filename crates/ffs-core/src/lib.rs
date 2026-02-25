@@ -1908,6 +1908,12 @@ impl OpenFs {
             u64::from(nodesize).max(65_536)
         };
         let total_bytes = sb.total_bytes.saturating_sub(data_start);
+        if total_bytes == 0 {
+            return Err(FfsError::Format(format!(
+                "btrfs image too small for writable allocation state: total_bytes={} data_start={}",
+                sb.total_bytes, data_start
+            )));
+        }
         extent_alloc.add_block_group(
             data_start,
             BtrfsBlockGroupItem {
@@ -11557,6 +11563,11 @@ mod tests {
         BTRFS_TEST_FS_TREE_LOGICAL + BTRFS_TEST_EXTENT_OFF
     }
 
+    fn set_btrfs_super_total_bytes(image: &mut [u8], total_bytes: u64) {
+        let sb_off = BTRFS_SUPER_INFO_OFFSET;
+        image[sb_off + 0x70..sb_off + 0x78].copy_from_slice(&total_bytes.to_le_bytes());
+    }
+
     fn set_btrfs_test_file_size(image: &mut [u8], size: u64) {
         let size_off = BTRFS_TEST_FS_TREE_LOGICAL + BTRFS_TEST_FILE_INODE_OFF + 16;
         image[size_off..size_off + 8].copy_from_slice(&size.to_le_bytes());
@@ -14726,6 +14737,25 @@ mod tests {
     fn btrfs_write_enable_writes_sets_writable() {
         let (fs, _cx) = open_writable_btrfs();
         assert!(fs.is_writable());
+    }
+
+    #[test]
+    fn btrfs_write_enable_writes_rejects_zero_sized_synthetic_group() {
+        let mut image = build_btrfs_fsops_image();
+        set_btrfs_super_total_bytes(&mut image, 65_536);
+
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let mut fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let err = fs.enable_writes(&cx).unwrap_err();
+
+        match err {
+            FfsError::Format(message) => {
+                assert!(message.contains("too small"));
+                assert!(message.contains("data_start=65536"));
+            }
+            other => panic!("expected format error for tiny btrfs image, got {other:?}"),
+        }
     }
 
     #[test]

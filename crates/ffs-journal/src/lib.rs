@@ -943,10 +943,6 @@ fn parse_descriptor_tags(block: &[u8]) -> Vec<DescriptorTag> {
             break;
         };
 
-        if target == 0 && flags == 0 {
-            break;
-        }
-
         let tag = DescriptorTag {
             target: BlockNumber(u64::from(target)),
             flags,
@@ -2801,5 +2797,295 @@ mod tests {
             dev.read_block(&cx, BlockNumber(4)).unwrap().as_slice(),
             &[0xBB; 512]
         );
+    }
+
+    // ── Property-based tests (proptest) ────────────────────────────────
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// JBD2 write → replay roundtrip: committed writes appear at target blocks.
+        #[test]
+        fn proptest_jbd2_write_replay_roundtrip(
+            num_writes in 1_usize..8,
+            payload_byte in any::<u8>(),
+            start_seq in 1_u32..1000,
+        ) {
+            let cx = test_cx();
+            let dev = MemBlockDevice::new(512, 512);
+            let region = JournalRegion {
+                start: BlockNumber(100),
+                blocks: 128,
+            };
+
+            let mut writer = Jbd2Writer::new(region, start_seq);
+            let mut txn = writer.begin_transaction();
+
+            // Each write targets a distinct block in [0, num_writes).
+            for i in 0..num_writes {
+                let target = BlockNumber(u64::try_from(i).unwrap());
+                let byte = payload_byte.wrapping_add(u8::try_from(i % 256).unwrap());
+                txn.add_write(target, vec![byte; 512]);
+            }
+
+            let (seq, stats) = writer.commit_transaction(&cx, &dev, &txn).expect("commit");
+            prop_assert_eq!(seq, start_seq);
+            prop_assert_eq!(stats.data_blocks, u64::try_from(num_writes).unwrap());
+
+            // Replay from the same region.
+            let out = replay_jbd2(&cx, &dev, region).expect("replay");
+            prop_assert_eq!(out.committed_sequences, vec![start_seq]);
+            prop_assert_eq!(out.stats.replayed_blocks, u64::try_from(num_writes).unwrap());
+
+            // Verify each target block contains the correct data.
+            for i in 0..num_writes {
+                let target = BlockNumber(u64::try_from(i).unwrap());
+                let expected_byte = payload_byte.wrapping_add(u8::try_from(i % 256).unwrap());
+                let data = dev.read_block(&cx, target).expect("read target");
+                prop_assert_eq!(
+                    data.as_slice()[0], expected_byte,
+                    "target block {} should contain {:#x}",
+                    i, expected_byte,
+                );
+            }
+        }
+
+        /// JBD2 write with revokes → replay roundtrip: revoked blocks are skipped.
+        #[test]
+        fn proptest_jbd2_revoke_skips_writes(
+            num_writes in 2_usize..8,
+            revoke_idx in 0_usize..8,
+        ) {
+            let actual_revoke_idx = revoke_idx % num_writes;
+
+            let cx = test_cx();
+            let dev = MemBlockDevice::new(512, 512);
+            let region = JournalRegion {
+                start: BlockNumber(200),
+                blocks: 128,
+            };
+
+            let mut writer = Jbd2Writer::new(region, 1);
+            let mut txn = writer.begin_transaction();
+
+            for i in 0..num_writes {
+                txn.add_write(BlockNumber(u64::try_from(i).unwrap()), vec![0xAA; 512]);
+            }
+            // Revoke one of the writes.
+            txn.add_revoke(BlockNumber(u64::try_from(actual_revoke_idx).unwrap()));
+
+            writer.commit_transaction(&cx, &dev, &txn).expect("commit");
+
+            let out = replay_jbd2(&cx, &dev, region).expect("replay");
+            prop_assert_eq!(out.stats.skipped_revoked_blocks, 1);
+            prop_assert_eq!(
+                out.stats.replayed_blocks,
+                u64::try_from(num_writes - 1).unwrap(),
+            );
+
+            // Revoked block should be untouched (zeros).
+            let revoked = dev
+                .read_block(&cx, BlockNumber(u64::try_from(actual_revoke_idx).unwrap()))
+                .expect("read revoked");
+            prop_assert_eq!(
+                revoked.as_slice(),
+                &[0_u8; 512],
+                "revoked block {} should be untouched",
+                actual_revoke_idx,
+            );
+        }
+
+        /// Jbd2Writer::blocks_needed accurately predicts journal consumption.
+        #[test]
+        fn proptest_blocks_needed_matches_actual(
+            num_writes in 0_usize..16,
+            num_revokes in 0_usize..16,
+        ) {
+            prop_assume!(num_writes > 0 || num_revokes > 0);
+
+            let cx = test_cx();
+            let dev = MemBlockDevice::new(512, 512);
+            let region = JournalRegion {
+                start: BlockNumber(100),
+                blocks: 256,
+            };
+
+            let predicted = Jbd2Writer::blocks_needed(512, num_writes, num_revokes);
+
+            let mut writer = Jbd2Writer::new(region, 1);
+            let head_before = writer.head();
+            let mut txn = writer.begin_transaction();
+
+            for i in 0..num_writes {
+                txn.add_write(BlockNumber(u64::try_from(i + 300).unwrap()), vec![0xBB; 512]);
+            }
+            for i in 0..num_revokes {
+                txn.add_revoke(BlockNumber(u64::try_from(i + 400).unwrap()));
+            }
+
+            writer.commit_transaction(&cx, &dev, &txn).expect("commit");
+            let actual_used = writer.head() - head_before;
+
+            prop_assert_eq!(
+                actual_used, predicted,
+                "blocks_needed({}, {}) predicted {}, actual {}",
+                num_writes, num_revokes, predicted, actual_used,
+            );
+        }
+
+        /// JournalRegion::resolve: in-range resolves correctly, out-of-range returns None.
+        #[test]
+        fn proptest_journal_region_resolve(
+            start in 0_u64..10_000,
+            blocks in 1_u64..1000,
+            index in 0_u64..2000,
+        ) {
+            let region = JournalRegion {
+                start: BlockNumber(start),
+                blocks,
+            };
+
+            let result = region.resolve(index);
+            if index < blocks {
+                let expected = start.checked_add(index).map(BlockNumber);
+                prop_assert_eq!(result, expected);
+            } else {
+                prop_assert_eq!(result, None);
+            }
+        }
+
+        /// JournalSegment::resolve: in-range resolves correctly, out-of-range returns None.
+        #[test]
+        fn proptest_journal_segment_resolve(
+            start in 0_u64..10_000,
+            blocks in 1_u64..1000,
+            index in 0_u64..2000,
+        ) {
+            let segment = JournalSegment {
+                start: BlockNumber(start),
+                blocks,
+            };
+
+            let result = segment.resolve(index);
+            if index < blocks {
+                let expected = start.checked_add(index).map(BlockNumber);
+                prop_assert_eq!(result, expected);
+            } else {
+                prop_assert_eq!(result, None);
+            }
+        }
+
+        /// parse_descriptor_tags never panics on arbitrary byte input.
+        #[test]
+        fn proptest_parse_descriptor_tags_no_panic(
+            data in prop::collection::vec(any::<u8>(), 0..1024),
+        ) {
+            let _ = parse_descriptor_tags(&data);
+        }
+
+        /// parse_revoke_entries never panics on arbitrary byte input.
+        #[test]
+        fn proptest_parse_revoke_entries_no_panic(
+            data in prop::collection::vec(any::<u8>(), 0..1024),
+        ) {
+            let _ = parse_revoke_entries(&data);
+        }
+
+        /// Native COW write → recover roundtrip: committed writes are recovered.
+        #[test]
+        fn proptest_native_cow_roundtrip(
+            num_writes in 1_usize..6,
+            payload_byte in any::<u8>(),
+        ) {
+            let cx = test_cx();
+            let dev = MemBlockDevice::new(512, 512);
+            let region = JournalRegion {
+                start: BlockNumber(50),
+                blocks: 64,
+            };
+
+            let mut journal = NativeCowJournal::open(&cx, &dev, region).expect("open");
+
+            for i in 0..num_writes {
+                let byte = payload_byte.wrapping_add(u8::try_from(i % 256).unwrap());
+                journal
+                    .append_write(
+                        &cx,
+                        &dev,
+                        CommitSeq(1),
+                        BlockNumber(u64::try_from(i).unwrap()),
+                        &vec![byte; 64],
+                    )
+                    .expect("write");
+            }
+            journal.append_commit(&cx, &dev, CommitSeq(1)).expect("commit");
+
+            let recovered = recover_native_cow(&cx, &dev, region).expect("recover");
+            prop_assert_eq!(recovered.len(), 1);
+            prop_assert_eq!(recovered[0].commit_seq, CommitSeq(1));
+            prop_assert_eq!(recovered[0].writes.len(), num_writes);
+
+            for i in 0..num_writes {
+                let expected_byte = payload_byte.wrapping_add(u8::try_from(i % 256).unwrap());
+                prop_assert_eq!(
+                    recovered[0].writes[i].block,
+                    BlockNumber(u64::try_from(i).unwrap()),
+                );
+                prop_assert_eq!(recovered[0].writes[i].bytes[0], expected_byte);
+            }
+        }
+
+        /// apply_replay writes exactly the non-revoked blocks.
+        #[test]
+        fn proptest_apply_replay_writes_non_revoked(
+            num_writes in 1_usize..6,
+            revoke_idx in 0_usize..6,
+        ) {
+            let actual_revoke_idx = revoke_idx % num_writes;
+
+            let cx = test_cx();
+            let dev = MemBlockDevice::new(512, 512);
+
+            let mut writes = Vec::new();
+            let mut revoked = BTreeSet::new();
+
+            for i in 0..num_writes {
+                let target = BlockNumber(u64::try_from(i).unwrap());
+                writes.push((target, vec![0xCC; 512]));
+            }
+            revoked.insert(BlockNumber(u64::try_from(actual_revoke_idx).unwrap()));
+
+            let committed = vec![(writes, revoked)];
+            let stats = apply_replay(&cx, &dev, &committed).expect("apply");
+
+            prop_assert_eq!(
+                stats.blocks_written,
+                u64::try_from(num_writes - 1).unwrap(),
+            );
+            prop_assert_eq!(stats.blocks_verified, stats.blocks_written);
+            prop_assert_eq!(stats.verify_mismatches, 0);
+
+            // Revoked block should be zeros.
+            let revoked_data = dev
+                .read_block(&cx, BlockNumber(u64::try_from(actual_revoke_idx).unwrap()))
+                .expect("read revoked");
+            prop_assert_eq!(revoked_data.as_slice(), &[0_u8; 512]);
+
+            // Non-revoked blocks should contain 0xCC.
+            for i in 0..num_writes {
+                if i == actual_revoke_idx {
+                    continue;
+                }
+                let data = dev
+                    .read_block(&cx, BlockNumber(u64::try_from(i).unwrap()))
+                    .expect("read");
+                prop_assert_eq!(
+                    data.as_slice()[0], 0xCC,
+                    "non-revoked block {} should contain 0xCC", i,
+                );
+            }
+        }
     }
 }

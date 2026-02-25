@@ -727,6 +727,7 @@ dependencies = [
  "ffs-extent",
  "ffs-ondisk",
  "ffs-types",
+ "proptest",
 ]
 
 [[package]]
@@ -739,6 +740,7 @@ dependencies = [
  "ffs-error",
  "ffs-types",
  "parking_lot",
+ "proptest",
  "tracing",
 ]
 

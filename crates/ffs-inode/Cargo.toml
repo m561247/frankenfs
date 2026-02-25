@@ -16,5 +16,8 @@ ffs-extent = { workspace = true }
 asupersync = { workspace = true }
 crc32c = { workspace = true }
 
+[dev-dependencies]
+proptest = { workspace = true }
+
 [lints]
 workspace = true
