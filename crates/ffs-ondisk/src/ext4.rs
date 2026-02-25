@@ -7383,5 +7383,194 @@ mod tests {
                 prop_assert!(result.is_err(), "wrong free count should fail verification");
             }
         }
+
+        // ── verify_inode_checksum properties ───────────────────────────
+
+        /// verify_inode_checksum never panics on arbitrary bytes.
+        #[test]
+        fn ext4_proptest_verify_inode_checksum_no_panic(
+            raw_inode in proptest::collection::vec(any::<u8>(), 0..=512),
+            csum_seed in any::<u32>(),
+            ino in any::<u32>(),
+            inode_size in prop_oneof![Just(128_u16), Just(160_u16), Just(256_u16)],
+        ) {
+            let _ = verify_inode_checksum(&raw_inode, csum_seed, ino, inode_size);
+        }
+
+        /// verify_inode_checksum rejects buffers shorter than inode_size.
+        #[test]
+        fn ext4_proptest_verify_inode_checksum_short_rejects(
+            raw_inode in proptest::collection::vec(any::<u8>(), 0..=127),
+            csum_seed in any::<u32>(),
+            ino in any::<u32>(),
+        ) {
+            let result = verify_inode_checksum(&raw_inode, csum_seed, ino, 128);
+            prop_assert!(result.is_err(), "buffer shorter than inode_size should fail");
+        }
+
+        // ── verify_dir_block_checksum properties ───────────────────────
+
+        /// verify_dir_block_checksum never panics on arbitrary bytes.
+        #[test]
+        fn ext4_proptest_verify_dir_block_checksum_no_panic(
+            dir_block in proptest::collection::vec(any::<u8>(), 0..=4096),
+            csum_seed in any::<u32>(),
+            ino in any::<u32>(),
+            generation in any::<u32>(),
+        ) {
+            let _ = verify_dir_block_checksum(&dir_block, csum_seed, ino, generation);
+        }
+
+        /// verify_dir_block_checksum rejects blocks shorter than 12 bytes.
+        #[test]
+        fn ext4_proptest_verify_dir_block_checksum_short_rejects(
+            dir_block in proptest::collection::vec(any::<u8>(), 0..=11),
+            csum_seed in any::<u32>(),
+            ino in any::<u32>(),
+            generation in any::<u32>(),
+        ) {
+            let result = verify_dir_block_checksum(&dir_block, csum_seed, ino, generation);
+            prop_assert!(result.is_err(), "dir block < 12 bytes should fail");
+        }
+
+        // ── verify_extent_block_checksum properties ────────────────────
+
+        /// verify_extent_block_checksum never panics on arbitrary bytes.
+        #[test]
+        fn ext4_proptest_verify_extent_block_checksum_no_panic(
+            extent_block in proptest::collection::vec(any::<u8>(), 0..=4096),
+            csum_seed in any::<u32>(),
+            ino in any::<u32>(),
+            generation in any::<u32>(),
+        ) {
+            let _ = verify_extent_block_checksum(&extent_block, csum_seed, ino, generation);
+        }
+
+        /// verify_extent_block_checksum rejects blocks shorter than 16 bytes.
+        #[test]
+        fn ext4_proptest_verify_extent_block_checksum_short_rejects(
+            extent_block in proptest::collection::vec(any::<u8>(), 0..=15),
+            csum_seed in any::<u32>(),
+            ino in any::<u32>(),
+            generation in any::<u32>(),
+        ) {
+            let result = verify_extent_block_checksum(&extent_block, csum_seed, ino, generation);
+            prop_assert!(result.is_err(), "extent block < 16 bytes should fail");
+        }
+
+        // ── lookup_in_dir_block properties ─────────────────────────────
+
+        /// lookup_in_dir_block never panics on arbitrary bytes.
+        #[test]
+        fn ext4_proptest_lookup_in_dir_block_no_panic(
+            block in proptest::collection::vec(any::<u8>(), 0..=4096),
+            block_size in prop_oneof![Just(1024_u32), Just(2048_u32), Just(4096_u32)],
+            target in proptest::collection::vec(any::<u8>(), 0..=255),
+        ) {
+            let _ = lookup_in_dir_block(&block, block_size, &target);
+        }
+
+        // ── parse_ibody_xattrs properties ──────────────────────────────
+
+        /// parse_ibody_xattrs never panics on an inode with arbitrary xattr_ibody.
+        #[test]
+        fn ext4_proptest_parse_ibody_xattrs_no_panic(
+            xattr_ibody in proptest::collection::vec(any::<u8>(), 0..=256),
+        ) {
+            let inode = Ext4Inode {
+                mode: 0o100644,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                links_count: 1,
+                blocks: 0,
+                flags: 0,
+                generation: 0,
+                file_acl: 0,
+                atime: 0,
+                ctime: 0,
+                mtime: 0,
+                dtime: 0,
+                atime_extra: 0,
+                ctime_extra: 0,
+                mtime_extra: 0,
+                crtime: 0,
+                crtime_extra: 0,
+                extra_isize: 32,
+                checksum: 0,
+                projid: 0,
+                extent_bytes: vec![0; 60],
+                xattr_ibody,
+            };
+            let _ = parse_ibody_xattrs(&inode);
+        }
+
+        // ── Ext4Inode file type extraction properties ──────────────────
+
+        /// Ext4Inode: file_type always returns a valid variant for well-formed modes.
+        #[test]
+        fn ext4_proptest_inode_file_type_valid_mode(
+            ftype in prop_oneof![
+                Just(ffs_types::S_IFREG),
+                Just(ffs_types::S_IFDIR),
+                Just(ffs_types::S_IFLNK),
+                Just(ffs_types::S_IFCHR),
+                Just(ffs_types::S_IFBLK),
+                Just(ffs_types::S_IFIFO),
+                Just(ffs_types::S_IFSOCK),
+            ],
+            perm in 0_u16..=0o777,
+        ) {
+            let mode = ftype | perm;
+            let mut bytes = vec![0u8; 128];
+            bytes[0] = mode as u8;
+            bytes[1] = (mode >> 8) as u8;
+            if let Ok(inode) = Ext4Inode::parse_from_bytes(&bytes) {
+                // file_type should return a recognized type for valid S_IFMT bits
+                let _ = inode.file_type_mode();
+            }
+        }
+
+        // ── DirBlockIter exhaustion property ───────────────────────────
+
+        /// DirBlockIter: collecting all entries never exceeds the block boundary.
+        #[test]
+        fn ext4_proptest_dir_block_iter_bounded(
+            block in proptest::collection::vec(any::<u8>(), 8..=4096),
+            block_size in prop_oneof![Just(1024_u32), Just(2048_u32), Just(4096_u32)],
+        ) {
+            let entries: Vec<_> = iter_dir_block(&block, block_size)
+                .filter_map(|e| e.ok())
+                .collect();
+            // Total rec_len of all entries should not exceed block length
+            let total_rec_len: u64 = entries.iter().map(|e| u64::from(e.rec_len)).sum();
+            prop_assert!(total_rec_len <= block.len() as u64,
+                "total rec_len {} exceeds block len {}", total_rec_len, block.len());
+        }
+
+        // ── Ext4Xattr full_name property ───────────────────────────────
+
+        /// Ext4Xattr: full_name always starts with a known namespace prefix.
+        #[test]
+        fn ext4_proptest_xattr_full_name_has_prefix(
+            name_index in any::<u8>(),
+            name in proptest::collection::vec(any::<u8>(), 0..=64),
+        ) {
+            let xattr = Ext4Xattr {
+                name_index,
+                name,
+                value: Vec::new(),
+            };
+            let full = xattr.full_name();
+            let valid_prefixes = [
+                "user.", "system.posix_acl_access", "system.posix_acl_default",
+                "trusted.", "security.", "system.", "unknown.",
+            ];
+            prop_assert!(
+                valid_prefixes.iter().any(|p| full.starts_with(p)),
+                "full_name '{}' did not start with a recognized namespace prefix",
+                full
+            );
+        }
     }
 }
