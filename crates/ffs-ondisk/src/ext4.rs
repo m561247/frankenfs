@@ -7154,7 +7154,7 @@ mod tests {
             let from_region = Ext4Superblock::parse_superblock_region(&sb).expect("region parser");
             let from_image = Ext4Superblock::parse_from_image(&image).expect("image parser");
 
-            prop_assert_eq!(from_image, from_region);
+            prop_assert_eq!(&from_image, &from_region);
             prop_assert_eq!(
                 from_image.validate_geometry().is_ok(),
                 from_region.validate_geometry().is_ok()
@@ -7228,7 +7228,7 @@ mod tests {
             }
             let iter_tail = iter.checksum_tail();
 
-            prop_assert_eq!(parsed_entries, iter_entries);
+            prop_assert_eq!(&parsed_entries, &iter_entries);
             prop_assert_eq!(parsed_tail, iter_tail);
             for entry in &parsed_entries {
                 prop_assert!(usize::try_from(entry.rec_len).expect("rec_len in usize") >= entry.actual_size());
