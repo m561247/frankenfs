@@ -2156,6 +2156,200 @@ mod tests {
         assert!(bitmap_find_contiguous(&bitmap, 16, 17, 0).is_none());
     }
 
+    // ── Hardening edge-case tests ────────────────────────────────────
+
+    #[test]
+    fn gd_flag_constants_match_ext4_spec() {
+        assert_eq!(GD_FLAG_INODE_UNINIT, 0x0001);
+        assert_eq!(GD_FLAG_BLOCK_UNINIT, 0x0002);
+    }
+
+    #[test]
+    fn persist_ctx_debug_clone() {
+        let pctx = PersistCtx {
+            gdt_block: BlockNumber(1),
+            desc_size: 32,
+            has_metadata_csum: false,
+            csum_seed: 0,
+        };
+        let cloned = pctx.clone();
+        assert_eq!(cloned.gdt_block, pctx.gdt_block);
+        assert_eq!(cloned.desc_size, pctx.desc_size);
+        let _ = format!("{pctx:?}");
+    }
+
+    #[test]
+    fn fs_geometry_zero_blocks_per_group_zero_group_count() {
+        let geo = FsGeometry {
+            blocks_per_group: 0,
+            inodes_per_group: 2048,
+            block_size: 4096,
+            total_blocks: 32768,
+            total_inodes: 8192,
+            first_data_block: 0,
+            group_count: 0,
+            inode_size: 256,
+        };
+        assert_eq!(geo.group_count, 0);
+    }
+
+    #[test]
+    fn fs_geometry_clone_and_debug() {
+        let geo = make_geometry();
+        let cloned = geo.clone();
+        assert_eq!(cloned.total_blocks, geo.total_blocks);
+        let _ = format!("{geo:?}");
+    }
+
+    #[test]
+    fn group_stats_clone_and_debug() {
+        let geo = make_geometry();
+        let groups = make_groups(&geo);
+        let cloned = groups[0].clone();
+        assert_eq!(cloned.group, groups[0].group);
+        let _ = format!("{:?}", groups[0]);
+    }
+
+    #[test]
+    fn block_alloc_debug_clone_copy_eq() {
+        let a = BlockAlloc {
+            start: BlockNumber(100),
+            count: 5,
+        };
+        let b = a; // Copy
+        assert_eq!(a, b);
+        let c = a.clone();
+        assert_eq!(a, c);
+        let _ = format!("{a:?}");
+
+        let d = BlockAlloc {
+            start: BlockNumber(200),
+            count: 5,
+        };
+        assert_ne!(a, d);
+    }
+
+    #[test]
+    fn inode_alloc_debug_clone_copy_eq() {
+        let a = InodeAlloc {
+            ino: InodeNumber(11),
+            group: GroupNumber(0),
+        };
+        let b = a; // Copy
+        assert_eq!(a, b);
+        let _ = format!("{a:?}");
+
+        let c = InodeAlloc {
+            ino: InodeNumber(12),
+            group: GroupNumber(0),
+        };
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn is_reserved_binary_search() {
+        let reserved = vec![0, 1, 2, 3, 10, 20];
+        assert!(is_reserved(&reserved, 0));
+        assert!(is_reserved(&reserved, 10));
+        assert!(is_reserved(&reserved, 20));
+        assert!(!is_reserved(&reserved, 5));
+        assert!(!is_reserved(&reserved, 100));
+    }
+
+    #[test]
+    fn bitmap_get_out_of_bounds_returns_false() {
+        let bitmap = [0xFF_u8; 1]; // 8 bits all set
+        assert!(bitmap_get(&bitmap, 0));
+        assert!(bitmap_get(&bitmap, 7));
+        assert!(!bitmap_get(&bitmap, 8)); // out of bounds
+        assert!(!bitmap_get(&bitmap, 100));
+    }
+
+    #[test]
+    fn bitmap_set_clear_out_of_bounds_is_noop() {
+        let mut bitmap = [0x00_u8; 1];
+        bitmap_set(&mut bitmap, 100); // should not panic
+        assert_eq!(bitmap[0], 0x00);
+        bitmap_clear(&mut bitmap, 100); // should not panic
+        assert_eq!(bitmap[0], 0x00);
+    }
+
+    #[test]
+    fn bitmap_count_free_partial_byte() {
+        // 2 bytes = 16 bits, but only count 10. First byte = 0xFF (all set), second = 0x00.
+        let bitmap = [0xFF_u8, 0x00];
+        // First 8 bits: all set (0 free). Bits 8-9: both free (2 free).
+        assert_eq!(bitmap_count_free(&bitmap, 10), 2);
+    }
+
+    #[test]
+    fn bitmap_find_contiguous_wraps_around() {
+        // 8 bits: 0b1111_0001 = 0xF1 → bits 1-3 are free, bits 4-7 set, bit 0 set.
+        let bitmap = [0xF1_u8];
+        // Find 3 contiguous starting from bit 0. Run at bits 1-3 should be found.
+        let found = bitmap_find_contiguous(&bitmap, 8, 3, 0).unwrap();
+        assert_eq!(found, 1);
+    }
+
+    #[test]
+    fn geometry_group_block_to_absolute_with_first_data_block() {
+        let geo = FsGeometry {
+            blocks_per_group: 8192,
+            inodes_per_group: 2048,
+            block_size: 4096,
+            total_blocks: 32768,
+            total_inodes: 8192,
+            first_data_block: 1, // non-zero
+            group_count: 4,
+            inode_size: 256,
+        };
+        // Group 0, rel 0 → absolute 1 (first_data_block).
+        assert_eq!(
+            geo.group_block_to_absolute(GroupNumber(0), 0),
+            BlockNumber(1)
+        );
+        // Group 1, rel 0 → absolute 1 + 8192 = 8193.
+        assert_eq!(
+            geo.group_block_to_absolute(GroupNumber(1), 0),
+            BlockNumber(8193)
+        );
+    }
+
+    #[test]
+    fn alloc_hint_with_goal_group() {
+        let hint = AllocHint {
+            goal_group: Some(GroupNumber(2)),
+            goal_block: None,
+        };
+        assert_eq!(hint.goal_group, Some(GroupNumber(2)));
+        assert!(hint.goal_block.is_none());
+    }
+
+    #[test]
+    fn group_stats_from_group_desc_maps_all_fields() {
+        let gd = Ext4GroupDesc {
+            block_bitmap: 100,
+            inode_bitmap: 101,
+            inode_table: 102,
+            free_blocks_count: 500,
+            free_inodes_count: 200,
+            used_dirs_count: 10,
+            itable_unused: 0,
+            flags: GD_FLAG_INODE_UNINIT | GD_FLAG_BLOCK_UNINIT,
+            checksum: 0,
+        };
+        let gs = GroupStats::from_group_desc(GroupNumber(3), &gd);
+        assert_eq!(gs.group, GroupNumber(3));
+        assert_eq!(gs.free_blocks, 500);
+        assert_eq!(gs.free_inodes, 200);
+        assert_eq!(gs.used_dirs, 10);
+        assert_eq!(gs.block_bitmap_block, BlockNumber(100));
+        assert_eq!(gs.inode_bitmap_block, BlockNumber(101));
+        assert_eq!(gs.inode_table_block, BlockNumber(102));
+        assert!(gs.block_bitmap_uninit());
+        assert!(gs.inode_bitmap_uninit());
+    }
+
     // ── Property-based tests (proptest) ────────────────────────────────
 
     use proptest::prelude::*;

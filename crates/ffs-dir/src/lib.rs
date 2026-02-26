@@ -844,6 +844,192 @@ mod tests {
         );
     }
 
+    // ── Hardening edge-case tests ────────────────────────────────────
+
+    #[test]
+    fn dir_entry_header_len_is_8() {
+        assert_eq!(DIR_ENTRY_HEADER_LEN, 8);
+    }
+
+    #[test]
+    fn htree_entry_debug_clone_copy_eq() {
+        let e = HtreeEntry {
+            hash: 0xDEAD,
+            block: 42,
+        };
+        let copy = e; // Copy
+        assert_eq!(e, copy);
+        let cloned = e.clone();
+        assert_eq!(e, cloned);
+        let _ = format!("{e:?}");
+
+        let different = HtreeEntry {
+            hash: 0xBEEF,
+            block: 42,
+        };
+        assert_ne!(e, different);
+    }
+
+    #[test]
+    fn htree_find_leaf_empty_returns_none() {
+        let entries: Vec<HtreeEntry> = Vec::new();
+        assert_eq!(htree_find_leaf(&entries, 100), None);
+    }
+
+    #[test]
+    fn htree_insert_into_empty_vec() {
+        let mut entries = Vec::new();
+        let idx = htree_insert(&mut entries, 42, 5);
+        assert_eq!(idx, 0);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], HtreeEntry { hash: 42, block: 5 });
+    }
+
+    #[test]
+    fn htree_find_leaf_target_below_all_entries() {
+        let entries = vec![
+            HtreeEntry {
+                hash: 100,
+                block: 1,
+            },
+            HtreeEntry {
+                hash: 200,
+                block: 2,
+            },
+        ];
+        // Target 50 is below all hashes → partition_point returns 0 → chosen = 0.
+        let leaf = htree_find_leaf(&entries, 50).unwrap();
+        assert_eq!(leaf, 1);
+    }
+
+    #[test]
+    fn htree_find_leaf_target_above_all_entries() {
+        let entries = vec![
+            HtreeEntry {
+                hash: 100,
+                block: 1,
+            },
+            HtreeEntry {
+                hash: 200,
+                block: 2,
+            },
+        ];
+        // Target 999 is above all hashes → rightmost entry.
+        let leaf = htree_find_leaf(&entries, 999).unwrap();
+        assert_eq!(leaf, 2);
+    }
+
+    #[test]
+    fn init_dir_block_file_types_are_dir() {
+        let mut block = vec![0u8; 1024];
+        init_dir_block(&mut block, 11, 2).unwrap();
+        let (entries, _) = parse_dir_block(&block, 1024).unwrap();
+        assert_eq!(entries[0].file_type, Ext4FileType::Dir);
+        assert_eq!(entries[1].file_type, Ext4FileType::Dir);
+    }
+
+    #[test]
+    fn add_entry_254_byte_name() {
+        // Name just under max (254 bytes) should succeed in a 4096 block.
+        let mut block = vec![0u8; 4096];
+        init_dir_block(&mut block, 2, 2).unwrap();
+        let name = vec![b'a'; 254];
+        let off = add_entry(&mut block, 100, &name, Ext4FileType::RegFile).unwrap();
+        assert!(off > 0);
+        let (entries, _) = parse_dir_block(&block, 4096).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[2].name, name);
+    }
+
+    #[test]
+    fn add_entry_exact_255_byte_name() {
+        let mut block = vec![0u8; 4096];
+        init_dir_block(&mut block, 2, 2).unwrap();
+        let name = vec![b'z'; 255];
+        let off = add_entry(&mut block, 100, &name, Ext4FileType::RegFile).unwrap();
+        assert!(off > 0);
+        let (entries, _) = parse_dir_block(&block, 4096).unwrap();
+        assert_eq!(entries[2].name.len(), 255);
+    }
+
+    #[test]
+    fn remove_middle_entry_coalesces_with_previous() {
+        let mut block = vec![0u8; 1024];
+        init_dir_block(&mut block, 2, 2).unwrap();
+        add_entry(&mut block, 10, b"first", Ext4FileType::RegFile).unwrap();
+        add_entry(&mut block, 20, b"second", Ext4FileType::RegFile).unwrap();
+        add_entry(&mut block, 30, b"third", Ext4FileType::RegFile).unwrap();
+
+        // Remove the middle entry "second".
+        let removed = remove_entry(&mut block, b"second").unwrap();
+        assert!(removed);
+
+        // "first" and "third" should still be present.
+        let (entries, _) = parse_dir_block(&block, 1024).unwrap();
+        let names: Vec<&[u8]> = entries.iter().map(|e| e.name.as_slice()).collect();
+        assert!(names.contains(&b".".as_slice()));
+        assert!(names.contains(&b"..".as_slice()));
+        assert!(names.contains(&b"first".as_slice()));
+        assert!(names.contains(&b"third".as_slice()));
+        assert!(!names.contains(&b"second".as_slice()));
+    }
+
+    #[test]
+    fn required_rec_len_alignment() {
+        // name_len=1: 8+1=9 → align4 → 12
+        assert_eq!(required_rec_len(1), 12);
+        // name_len=2: 8+2=10 → align4 → 12
+        assert_eq!(required_rec_len(2), 12);
+        // name_len=4: 8+4=12 → align4 → 12
+        assert_eq!(required_rec_len(4), 12);
+        // name_len=5: 8+5=13 → align4 → 16
+        assert_eq!(required_rec_len(5), 16);
+        // name_len=255: 8+255=263 → align4 → 264
+        assert_eq!(required_rec_len(255), 264);
+    }
+
+    #[test]
+    fn compute_dx_hash_version_zero() {
+        let seed = [0_u32; 4];
+        let h = compute_dx_hash(0, b"test", &seed);
+        // Version 0 = legacy, should still produce a non-trivial hash.
+        // Just verify it doesn't panic and produces something.
+        let _ = h;
+    }
+
+    #[test]
+    fn add_and_remove_all_entries_leaves_clean_block() {
+        let mut block = vec![0u8; 1024];
+        init_dir_block(&mut block, 2, 2).unwrap();
+
+        // Add several entries.
+        add_entry(&mut block, 10, b"alpha", Ext4FileType::RegFile).unwrap();
+        add_entry(&mut block, 20, b"beta", Ext4FileType::RegFile).unwrap();
+        add_entry(&mut block, 30, b"gamma", Ext4FileType::RegFile).unwrap();
+
+        // Remove all non-dot entries.
+        assert!(remove_entry(&mut block, b"alpha").unwrap());
+        assert!(remove_entry(&mut block, b"beta").unwrap());
+        assert!(remove_entry(&mut block, b"gamma").unwrap());
+
+        // Only dot and dotdot should remain.
+        let (entries, _) = parse_dir_block(&block, 1024).unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn write_entry_various_file_types() {
+        for ft in [
+            Ext4FileType::RegFile,
+            Ext4FileType::Dir,
+            Ext4FileType::Symlink,
+        ] {
+            let mut block = vec![0u8; 64];
+            write_entry(&mut block, 0, 42, 64, ft, b"test").unwrap();
+            assert_eq!(block[7], ft as u8);
+        }
+    }
+
     // ── Property-based tests (proptest) ────────────────────────────────
 
     use proptest::prelude::*;

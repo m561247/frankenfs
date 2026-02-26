@@ -3428,6 +3428,195 @@ mod tests {
         assert_eq!(a, b);
     }
 
+    // ── Hardening edge-case tests ────────────────────────────────────
+
+    #[test]
+    fn jbd2_constants_match_kernel_spec() {
+        assert_eq!(JBD2_MAGIC, 0xC03B_3998);
+        assert_eq!(JBD2_BLOCKTYPE_DESCRIPTOR, 1);
+        assert_eq!(JBD2_BLOCKTYPE_COMMIT, 2);
+        assert_eq!(JBD2_BLOCKTYPE_REVOKE, 5);
+        assert_eq!(JBD2_HEADER_SIZE, 12);
+        assert_eq!(JBD2_REVOKE_HEADER_SIZE, 16);
+        assert_eq!(JBD2_TAG_SIZE, 8);
+        assert_eq!(JBD2_TAG_FLAG_LAST, 0x0000_0008);
+    }
+
+    #[test]
+    fn cow_constants_match_spec() {
+        assert_eq!(COW_MAGIC, 0x4A53_4646);
+        assert_eq!(COW_VERSION, 1);
+        assert_eq!(COW_RECORD_WRITE, 1);
+        assert_eq!(COW_RECORD_COMMIT, 2);
+        assert_eq!(COW_HEADER_SIZE, 32);
+    }
+
+    #[test]
+    fn journal_segment_debug_clone_copy_eq() {
+        let seg = JournalSegment {
+            start: BlockNumber(100),
+            blocks: 50,
+        };
+        let copy = seg; // Copy
+        assert_eq!(seg, copy);
+        let cloned = seg.clone();
+        assert_eq!(seg, cloned);
+        let _ = format!("{seg:?}");
+
+        let different = JournalSegment {
+            start: BlockNumber(200),
+            blocks: 50,
+        };
+        assert_ne!(seg, different);
+    }
+
+    #[test]
+    fn journal_region_debug_clone_copy_eq() {
+        let reg = JournalRegion {
+            start: BlockNumber(100),
+            blocks: 50,
+        };
+        let copy = reg; // Copy
+        assert_eq!(reg, copy);
+        let _ = format!("{reg:?}");
+    }
+
+    #[test]
+    fn replay_stats_clone_eq() {
+        let a = ReplayStats {
+            scanned_blocks: 10,
+            ..Default::default()
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+        let c = ReplayStats {
+            scanned_blocks: 20,
+            ..Default::default()
+        };
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn replay_outcome_clone_eq() {
+        let a = ReplayOutcome {
+            committed_sequences: vec![1, 2, 3],
+            stats: ReplayStats::default(),
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn apply_stats_default_is_zeroed() {
+        let s = ApplyStats::default();
+        assert_eq!(s.blocks_written, 0);
+        assert_eq!(s.blocks_verified, 0);
+        assert_eq!(s.verify_mismatches, 0);
+    }
+
+    #[test]
+    fn jbd2_writer_debug_clone_eq() {
+        let region = JournalRegion {
+            start: BlockNumber(100),
+            blocks: 50,
+        };
+        let writer = Jbd2Writer::new(region, 1);
+        let cloned = writer.clone();
+        assert_eq!(writer, cloned);
+        let _ = format!("{writer:?}");
+    }
+
+    #[test]
+    fn jbd2_transaction_debug_clone() {
+        let region = JournalRegion {
+            start: BlockNumber(100),
+            blocks: 50,
+        };
+        let mut writer = Jbd2Writer::new(region, 1);
+        let txn = writer.begin_transaction();
+        let cloned = txn.clone();
+        assert_eq!(cloned.sequence(), txn.sequence());
+        let _ = format!("{txn:?}");
+    }
+
+    #[test]
+    fn cow_write_debug_clone_eq() {
+        let w = CowWrite {
+            block: BlockNumber(42),
+            bytes: vec![1, 2, 3],
+        };
+        let cloned = w.clone();
+        assert_eq!(w, cloned);
+        let _ = format!("{w:?}");
+
+        let different = CowWrite {
+            block: BlockNumber(42),
+            bytes: vec![4, 5, 6],
+        };
+        assert_ne!(w, different);
+    }
+
+    #[test]
+    fn native_cow_journal_debug_clone_eq() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096, 100);
+        let region = JournalRegion {
+            start: BlockNumber(10),
+            blocks: 20,
+        };
+        let journal = NativeCowJournal::open(&cx, &dev, region).unwrap();
+        let cloned = journal.clone();
+        assert_eq!(journal, cloned);
+        let _ = format!("{journal:?}");
+    }
+
+    #[test]
+    fn descriptor_tag_is_last_flag() {
+        let tag_not_last = DescriptorTag {
+            target: BlockNumber(0),
+            flags: 0,
+        };
+        assert!(!tag_not_last.is_last());
+
+        let tag_last = DescriptorTag {
+            target: BlockNumber(0),
+            flags: JBD2_TAG_FLAG_LAST,
+        };
+        assert!(tag_last.is_last());
+
+        // Flag combined with other bits.
+        let tag_combined = DescriptorTag {
+            target: BlockNumber(0),
+            flags: JBD2_TAG_FLAG_LAST | 0x0001,
+        };
+        assert!(tag_combined.is_last());
+    }
+
+    #[test]
+    fn jbd2_header_parse_too_short_returns_none() {
+        let short = [0u8; JBD2_HEADER_SIZE - 1];
+        assert!(Jbd2Header::parse(&short).is_none());
+    }
+
+    #[test]
+    fn jbd2_header_parse_valid() {
+        let raw = jbd2_header(JBD2_BLOCKTYPE_DESCRIPTOR, 42);
+        let hdr = Jbd2Header::parse(&raw).unwrap();
+        assert_eq!(hdr.magic, JBD2_MAGIC);
+        assert_eq!(hdr.block_type, JBD2_BLOCKTYPE_DESCRIPTOR);
+        assert_eq!(hdr.sequence, 42);
+    }
+
+    #[test]
+    fn max_revoke_entries_scales_with_block_size() {
+        // 4096 block: (4096 - 16) / 4 = 1020.
+        assert_eq!(max_revoke_entries(4096), 1020);
+        // 1024 block: (1024 - 16) / 4 = 252.
+        assert_eq!(max_revoke_entries(1024), 252);
+        // Block size smaller than header: saturating_sub returns 0.
+        assert_eq!(max_revoke_entries(8), 0);
+    }
+
     // ── Property-based tests (proptest) ────────────────────────────────
 
     use proptest::prelude::*;
