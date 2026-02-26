@@ -1184,7 +1184,7 @@ mod tests {
 
         let failed_evidence = RecoveryEvidence {
             outcome: RecoveryOutcome::Failed,
-            ..result.evidence.clone()
+            ..result.evidence
         };
         let failed_result = RecoveryAttemptResult {
             evidence: failed_evidence,

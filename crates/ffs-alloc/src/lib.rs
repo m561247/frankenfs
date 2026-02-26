@@ -2026,6 +2026,136 @@ mod tests {
         );
     }
 
+    // ── Edge-case hardening tests ──────────────────────────────────────
+
+    #[test]
+    fn group_stats_uninit_flags() {
+        let mut gs = GroupStats {
+            group: GroupNumber(0),
+            free_blocks: 100,
+            free_inodes: 50,
+            used_dirs: 0,
+            block_bitmap_block: BlockNumber(1),
+            inode_bitmap_block: BlockNumber(2),
+            inode_table_block: BlockNumber(3),
+            flags: 0,
+        };
+        assert!(!gs.block_bitmap_uninit());
+        assert!(!gs.inode_bitmap_uninit());
+
+        gs.flags = 0x0001; // GD_FLAG_INODE_UNINIT
+        assert!(!gs.block_bitmap_uninit());
+        assert!(gs.inode_bitmap_uninit());
+
+        gs.flags = 0x0002; // GD_FLAG_BLOCK_UNINIT
+        assert!(gs.block_bitmap_uninit());
+        assert!(!gs.inode_bitmap_uninit());
+
+        gs.flags = 0x0003; // both
+        assert!(gs.block_bitmap_uninit());
+        assert!(gs.inode_bitmap_uninit());
+    }
+
+    #[test]
+    fn geometry_coordinate_roundtrip_with_first_data_block() {
+        let geo = FsGeometry {
+            blocks_per_group: 32768,
+            inodes_per_group: 8192,
+            block_size: 4096,
+            total_blocks: 131072,
+            total_inodes: 32768,
+            first_data_block: 1,
+            group_count: 4,
+            inode_size: 256,
+        };
+        // Group 0, rel 0 -> absolute = first_data_block + 0 = 1
+        let abs = geo.group_block_to_absolute(GroupNumber(0), 0);
+        assert_eq!(abs, BlockNumber(1));
+
+        let (g, r) = geo.absolute_to_group_block(BlockNumber(1));
+        assert_eq!(g, GroupNumber(0));
+        assert_eq!(r, 0);
+
+        // Group 1, rel 5 -> absolute = 1 + 32768 + 5 = 32774
+        let abs2 = geo.group_block_to_absolute(GroupNumber(1), 5);
+        assert_eq!(abs2, BlockNumber(32774));
+        let (g2, r2) = geo.absolute_to_group_block(abs2);
+        assert_eq!(g2, GroupNumber(1));
+        assert_eq!(r2, 5);
+    }
+
+    #[test]
+    fn geometry_inodes_in_last_group_may_be_smaller() {
+        let geo = FsGeometry {
+            blocks_per_group: 8192,
+            inodes_per_group: 2048,
+            block_size: 4096,
+            total_blocks: 20000,
+            total_inodes: 5000, // 2 full groups + partial
+            first_data_block: 0,
+            group_count: 3,
+            inode_size: 256,
+        };
+        assert_eq!(geo.inodes_in_group(GroupNumber(0)), 2048);
+        assert_eq!(geo.inodes_in_group(GroupNumber(1)), 2048);
+        assert_eq!(geo.inodes_in_group(GroupNumber(2)), 904); // 5000 - 4096
+    }
+
+    #[test]
+    fn alloc_hint_default_has_no_preferences() {
+        let hint = AllocHint::default();
+        assert!(hint.goal_group.is_none());
+        assert!(hint.goal_block.is_none());
+    }
+
+    #[test]
+    fn block_alloc_and_inode_alloc_equality() {
+        let a = BlockAlloc {
+            start: BlockNumber(10),
+            count: 3,
+        };
+        let b = BlockAlloc {
+            start: BlockNumber(10),
+            count: 3,
+        };
+        assert_eq!(a, b);
+
+        let ia = InodeAlloc {
+            ino: InodeNumber(100),
+            group: GroupNumber(2),
+        };
+        let ib = InodeAlloc {
+            ino: InodeNumber(100),
+            group: GroupNumber(2),
+        };
+        assert_eq!(ia, ib);
+    }
+
+    #[test]
+    fn bitmap_full_count_free_is_zero() {
+        let bitmap = [0xFF_u8; 4];
+        assert_eq!(bitmap_count_free(&bitmap, 32), 0);
+    }
+
+    #[test]
+    fn bitmap_empty_count_free_is_count() {
+        let bitmap = [0x00_u8; 4];
+        assert_eq!(bitmap_count_free(&bitmap, 32), 32);
+        assert_eq!(bitmap_count_free(&bitmap, 16), 16);
+    }
+
+    #[test]
+    fn bitmap_find_free_on_full_returns_none() {
+        let bitmap = [0xFF_u8; 4];
+        assert!(bitmap_find_free(&bitmap, 32, 0).is_none());
+    }
+
+    #[test]
+    fn bitmap_find_contiguous_larger_than_available_returns_none() {
+        let bitmap = [0x00_u8; 2]; // 16 bits free
+        assert!(bitmap_find_contiguous(&bitmap, 16, 17, 0).is_none());
+    }
+
     // ── Property-based tests (proptest) ────────────────────────────────
 
     use proptest::prelude::*;

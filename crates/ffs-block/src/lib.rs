@@ -6721,8 +6721,14 @@ mod tests {
             capacity: 0,
             p: 0,
         };
-        assert_eq!(m.hit_ratio(), 0.0);
-        assert_eq!(m.dirty_ratio(), 0.0);
+        assert!(
+            m.hit_ratio().abs() < f64::EPSILON,
+            "hit_ratio should be zero"
+        );
+        assert!(
+            m.dirty_ratio().abs() < f64::EPSILON,
+            "dirty_ratio should be zero"
+        );
     }
 
     #[test]
@@ -6743,7 +6749,10 @@ mod tests {
             capacity: 0,
             p: 0,
         };
-        assert_eq!(m.dirty_ratio(), 0.0);
+        assert!(
+            m.dirty_ratio().abs() < f64::EPSILON,
+            "dirty_ratio should be zero with zero capacity"
+        );
         // hit_ratio should still work.
         let ratio = m.hit_ratio();
         assert!((ratio - 10.0 / 15.0).abs() < 1e-10);

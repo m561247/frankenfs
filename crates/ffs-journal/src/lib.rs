@@ -3279,6 +3279,155 @@ mod tests {
         assert_eq!(outcome.stats, ReplayStats::default());
     }
 
+    // ── Edge-case hardening tests ──────────────────────────────────────
+
+    #[test]
+    fn journal_segment_resolve_within_range() {
+        let seg = JournalSegment {
+            start: BlockNumber(100),
+            blocks: 10,
+        };
+        assert_eq!(seg.resolve(0), Some(BlockNumber(100)));
+        assert_eq!(seg.resolve(9), Some(BlockNumber(109)));
+        assert_eq!(seg.resolve(10), None);
+    }
+
+    #[test]
+    fn journal_segment_empty() {
+        let seg = JournalSegment {
+            start: BlockNumber(0),
+            blocks: 0,
+        };
+        assert!(seg.is_empty());
+        assert_eq!(seg.resolve(0), None);
+    }
+
+    #[test]
+    fn journal_region_boundary_resolve() {
+        let region = JournalRegion {
+            start: BlockNumber(50),
+            blocks: 5,
+        };
+        assert!(!region.is_empty());
+        assert_eq!(region.resolve(0), Some(BlockNumber(50)));
+        assert_eq!(region.resolve(4), Some(BlockNumber(54)));
+        assert_eq!(region.resolve(5), None);
+    }
+
+    #[test]
+    fn replay_stats_default_is_zeroed() {
+        let stats = ReplayStats::default();
+        assert_eq!(stats.scanned_blocks, 0);
+        assert_eq!(stats.descriptor_blocks, 0);
+        assert_eq!(stats.commit_blocks, 0);
+        assert_eq!(stats.revoke_blocks, 0);
+        assert_eq!(stats.replayed_blocks, 0);
+        assert_eq!(stats.orphaned_commit_blocks, 0);
+        assert_eq!(stats.incomplete_transactions, 0);
+    }
+
+    #[test]
+    fn jbd2_write_stats_default_is_zeroed() {
+        let stats = Jbd2WriteStats::default();
+        assert_eq!(stats.descriptor_blocks, 0);
+        assert_eq!(stats.data_blocks, 0);
+        assert_eq!(stats.revoke_blocks, 0);
+        assert_eq!(stats.commit_blocks, 0);
+    }
+
+    #[test]
+    fn jbd2_writer_blocks_needed_zero_writes_and_revokes() {
+        // Zero writes, zero revokes: just the commit block.
+        assert_eq!(Jbd2Writer::blocks_needed(4096, 0, 0), 1);
+    }
+
+    #[test]
+    fn jbd2_writer_blocks_needed_single_write() {
+        // 1 write: descriptor(1) + data(1) + commit(1) = 3
+        assert_eq!(Jbd2Writer::blocks_needed(4096, 1, 0), 3);
+    }
+
+    #[test]
+    fn jbd2_writer_blocks_needed_with_revokes() {
+        // revokes add revoke block(s) before commit
+        let needed = Jbd2Writer::blocks_needed(4096, 0, 1);
+        // 0 writes → no descriptor; 1 revoke → 1 revoke block; 1 commit = 2
+        assert_eq!(needed, 2);
+    }
+
+    #[test]
+    fn jbd2_writer_blocks_needed_monotonic() {
+        // More writes should need more blocks.
+        let a = Jbd2Writer::blocks_needed(4096, 1, 0);
+        let b = Jbd2Writer::blocks_needed(4096, 5, 0);
+        let c = Jbd2Writer::blocks_needed(4096, 10, 0);
+        assert!(a <= b);
+        assert!(b <= c);
+    }
+
+    #[test]
+    fn jbd2_writer_new_state() {
+        let region = JournalRegion {
+            start: BlockNumber(100),
+            blocks: 50,
+        };
+        let writer = Jbd2Writer::new(region, 1);
+        assert_eq!(writer.head(), 0);
+        assert_eq!(writer.next_seq(), 1);
+        assert_eq!(writer.free_blocks(), 50);
+    }
+
+    #[test]
+    fn jbd2_transaction_accessors_consistent() {
+        let region = JournalRegion {
+            start: BlockNumber(100),
+            blocks: 100,
+        };
+        let mut writer = Jbd2Writer::new(region, 42);
+        let mut txn = writer.begin_transaction();
+        assert_eq!(txn.sequence(), 42);
+        assert_eq!(txn.write_count(), 0);
+        assert_eq!(txn.revoke_count(), 0);
+
+        txn.add_write(BlockNumber(10), vec![0xAA; 64]);
+        txn.add_write(BlockNumber(11), vec![0xBB; 64]);
+        txn.add_revoke(BlockNumber(20));
+        assert_eq!(txn.write_count(), 2);
+        assert_eq!(txn.revoke_count(), 1);
+    }
+
+    #[test]
+    fn cow_write_equality() {
+        let a = CowWrite {
+            block: BlockNumber(5),
+            bytes: vec![1, 2, 3],
+        };
+        let b = CowWrite {
+            block: BlockNumber(5),
+            bytes: vec![1, 2, 3],
+        };
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn recovered_commit_equality() {
+        let a = RecoveredCommit {
+            commit_seq: CommitSeq(1),
+            writes: vec![CowWrite {
+                block: BlockNumber(0),
+                bytes: vec![0xFF],
+            }],
+        };
+        let b = RecoveredCommit {
+            commit_seq: CommitSeq(1),
+            writes: vec![CowWrite {
+                block: BlockNumber(0),
+                bytes: vec![0xFF],
+            }],
+        };
+        assert_eq!(a, b);
+    }
+
     // ── Property-based tests (proptest) ────────────────────────────────
 
     use proptest::prelude::*;

@@ -2987,7 +2987,7 @@ mod tests {
         // Insert an unwritten extent (bit 15 set in raw_len).
         let ext = Ext4Extent {
             logical_block: 0,
-            raw_len: EXT_INIT_MAX_LEN | 10, // 0x8000 | 10 = unwritten, 10 blocks
+            raw_len: EXT_INIT_MAX_LEN | 0x0A, // 0x8000 | 0x0A = unwritten, 10 blocks
             physical_start: 500,
         };
         insert(&cx, &dev, &mut root, ext, &mut alloc).unwrap();
