@@ -6919,6 +6919,278 @@ mod tests {
         sb
     }
 
+    // ══════════════════════════════════════════════════════════════════
+    //  Ext4Superblock query method tests
+    // ══════════════════════════════════════════════════════════════════
+
+    /// Parse `make_valid_sb()` with the given incompat flags into an Ext4Superblock.
+    fn parse_valid_sb_with_incompat(incompat: u32) -> Ext4Superblock {
+        let mut sb = make_valid_sb();
+        sb[0x60..0x64].copy_from_slice(&incompat.to_le_bytes());
+        Ext4Superblock::parse_superblock_region(&sb).expect("parse valid sb")
+    }
+
+    #[test]
+    fn has_compat_detects_set_flags() {
+        let mut sb = make_valid_sb();
+        let compat =
+            (Ext4CompatFeatures::HAS_JOURNAL.0 | Ext4CompatFeatures::EXT_ATTR.0).to_le_bytes();
+        sb[0x5C..0x60].copy_from_slice(&compat);
+        let parsed = Ext4Superblock::parse_superblock_region(&sb).expect("parse");
+        assert!(parsed.has_compat(Ext4CompatFeatures::HAS_JOURNAL));
+        assert!(parsed.has_compat(Ext4CompatFeatures::EXT_ATTR));
+        assert!(!parsed.has_compat(Ext4CompatFeatures::DIR_INDEX));
+    }
+
+    #[test]
+    fn has_incompat_detects_set_flags() {
+        let parsed = parse_valid_sb_with_incompat(
+            Ext4IncompatFeatures::FILETYPE.0 | Ext4IncompatFeatures::EXTENTS.0,
+        );
+        assert!(parsed.has_incompat(Ext4IncompatFeatures::FILETYPE));
+        assert!(parsed.has_incompat(Ext4IncompatFeatures::EXTENTS));
+        assert!(!parsed.has_incompat(Ext4IncompatFeatures::BIT64));
+        assert!(!parsed.has_incompat(Ext4IncompatFeatures::ENCRYPT));
+    }
+
+    #[test]
+    fn has_ro_compat_detects_set_flags() {
+        let mut sb = make_valid_sb();
+        let ro_compat =
+            (Ext4RoCompatFeatures::SPARSE_SUPER.0 | Ext4RoCompatFeatures::LARGE_FILE.0)
+                .to_le_bytes();
+        sb[0x64..0x68].copy_from_slice(&ro_compat);
+        let parsed = Ext4Superblock::parse_superblock_region(&sb).expect("parse");
+        assert!(parsed.has_ro_compat(Ext4RoCompatFeatures::SPARSE_SUPER));
+        assert!(parsed.has_ro_compat(Ext4RoCompatFeatures::LARGE_FILE));
+        assert!(!parsed.has_ro_compat(Ext4RoCompatFeatures::METADATA_CSUM));
+    }
+
+    #[test]
+    fn is_64bit_false_without_flag() {
+        let parsed = parse_valid_sb_with_incompat(
+            Ext4IncompatFeatures::FILETYPE.0 | Ext4IncompatFeatures::EXTENTS.0,
+        );
+        assert!(!parsed.is_64bit());
+    }
+
+    #[test]
+    fn is_64bit_true_with_flag() {
+        let mut sb = make_valid_sb();
+        let incompat = (Ext4IncompatFeatures::FILETYPE.0
+            | Ext4IncompatFeatures::EXTENTS.0
+            | Ext4IncompatFeatures::BIT64.0)
+            .to_le_bytes();
+        sb[0x60..0x64].copy_from_slice(&incompat);
+        sb[0xFE..0x100].copy_from_slice(&64_u16.to_le_bytes()); // desc_size=64
+        let parsed = Ext4Superblock::parse_superblock_region(&sb).expect("parse");
+        assert!(parsed.is_64bit());
+    }
+
+    #[test]
+    fn group_desc_size_32_for_non_64bit() {
+        let parsed = parse_valid_sb_with_incompat(
+            Ext4IncompatFeatures::FILETYPE.0 | Ext4IncompatFeatures::EXTENTS.0,
+        );
+        assert_eq!(parsed.group_desc_size(), 32);
+    }
+
+    #[test]
+    fn group_desc_size_clamps_to_64_for_64bit() {
+        let mut sb = make_valid_sb();
+        let incompat = (Ext4IncompatFeatures::FILETYPE.0
+            | Ext4IncompatFeatures::EXTENTS.0
+            | Ext4IncompatFeatures::BIT64.0)
+            .to_le_bytes();
+        sb[0x60..0x64].copy_from_slice(&incompat);
+        sb[0xFE..0x100].copy_from_slice(&32_u16.to_le_bytes()); // desc_size=32 < 64
+        let parsed = Ext4Superblock::parse_superblock_region(&sb).expect("parse");
+        assert_eq!(parsed.group_desc_size(), 64); // clamped
+    }
+
+    #[test]
+    fn group_desc_size_128_for_64bit_when_specified() {
+        let mut sb = make_valid_sb();
+        let incompat = (Ext4IncompatFeatures::FILETYPE.0
+            | Ext4IncompatFeatures::EXTENTS.0
+            | Ext4IncompatFeatures::BIT64.0)
+            .to_le_bytes();
+        sb[0x60..0x64].copy_from_slice(&incompat);
+        sb[0xFE..0x100].copy_from_slice(&128_u16.to_le_bytes());
+        let parsed = Ext4Superblock::parse_superblock_region(&sb).expect("parse");
+        assert_eq!(parsed.group_desc_size(), 128);
+    }
+
+    #[test]
+    fn groups_count_single_group() {
+        let parsed = parse_valid_sb_with_incompat(
+            Ext4IncompatFeatures::FILETYPE.0 | Ext4IncompatFeatures::EXTENTS.0,
+        );
+        // blocks_count=32768, blocks_per_group=32768 → 1 group
+        assert_eq!(parsed.groups_count(), 1);
+    }
+
+    #[test]
+    fn groups_count_zero_blocks_per_group_returns_zero() {
+        let mut sb = make_valid_sb();
+        sb[0x20..0x24].copy_from_slice(&0_u32.to_le_bytes()); // blocks_per_group=0
+        let parsed = Ext4Superblock::parse_superblock_region(&sb).expect("parse");
+        assert_eq!(parsed.groups_count(), 0);
+    }
+
+    #[test]
+    fn groups_count_rounds_up_partial() {
+        let mut sb = make_valid_sb();
+        sb[0x04..0x08].copy_from_slice(&33000_u32.to_le_bytes()); // blocks_count > 32768
+        let incompat =
+            (Ext4IncompatFeatures::FILETYPE.0 | Ext4IncompatFeatures::EXTENTS.0).to_le_bytes();
+        sb[0x60..0x64].copy_from_slice(&incompat);
+        // inodes_count must accommodate groups * inodes_per_group
+        sb[0x00..0x04].copy_from_slice(&16384_u32.to_le_bytes());
+        let parsed = Ext4Superblock::parse_superblock_region(&sb).expect("parse");
+        assert_eq!(parsed.groups_count(), 2); // ceil(33000/32768)
+    }
+
+    #[test]
+    fn has_metadata_csum_false_without_flag() {
+        let parsed = parse_valid_sb_with_incompat(
+            Ext4IncompatFeatures::FILETYPE.0 | Ext4IncompatFeatures::EXTENTS.0,
+        );
+        assert!(!parsed.has_metadata_csum());
+    }
+
+    #[test]
+    fn has_metadata_csum_true_with_flag() {
+        let mut sb = make_valid_sb();
+        let ro_compat = Ext4RoCompatFeatures::METADATA_CSUM.0.to_le_bytes();
+        sb[0x64..0x68].copy_from_slice(&ro_compat);
+        let parsed = Ext4Superblock::parse_superblock_region(&sb).expect("parse");
+        assert!(parsed.has_metadata_csum());
+    }
+
+    #[test]
+    fn csum_seed_from_uuid() {
+        let mut sb = make_valid_sb();
+        // Set a specific UUID
+        let uuid: [u8; 16] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        sb[0x68..0x78].copy_from_slice(&uuid);
+        let parsed = Ext4Superblock::parse_superblock_region(&sb).expect("parse");
+        let expected = ext4_chksum(!0u32, &uuid);
+        assert_eq!(parsed.csum_seed(), expected);
+    }
+
+    #[test]
+    fn csum_seed_from_stored_when_csum_seed_flag() {
+        let mut sb = make_valid_sb();
+        let incompat = (Ext4IncompatFeatures::FILETYPE.0
+            | Ext4IncompatFeatures::EXTENTS.0
+            | Ext4IncompatFeatures::CSUM_SEED.0)
+            .to_le_bytes();
+        sb[0x60..0x64].copy_from_slice(&incompat);
+        sb[0x270..0x274].copy_from_slice(&0xDEAD_BEEF_u32.to_le_bytes()); // checksum_seed
+        let parsed = Ext4Superblock::parse_superblock_region(&sb).expect("parse");
+        assert_eq!(parsed.csum_seed(), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn validate_checksum_skips_without_metadata_csum() {
+        let parsed = parse_valid_sb_with_incompat(
+            Ext4IncompatFeatures::FILETYPE.0 | Ext4IncompatFeatures::EXTENTS.0,
+        );
+        assert!(parsed.validate_checksum(&[0; 1024]).is_ok()); // no-op
+    }
+
+    #[test]
+    fn validate_checksum_rejects_short_region() {
+        let mut sb = make_valid_sb();
+        let ro_compat = Ext4RoCompatFeatures::METADATA_CSUM.0.to_le_bytes();
+        sb[0x64..0x68].copy_from_slice(&ro_compat);
+        let parsed = Ext4Superblock::parse_superblock_region(&sb).expect("parse");
+        assert!(parsed.validate_checksum(&[0; 500]).is_err());
+    }
+
+    #[test]
+    fn group_desc_offset_4k_block_group_0() {
+        let parsed = parse_valid_sb_with_incompat(
+            Ext4IncompatFeatures::FILETYPE.0 | Ext4IncompatFeatures::EXTENTS.0,
+        );
+        // 4K blocks: GDT starts at block 1 = byte 4096
+        assert_eq!(
+            parsed.group_desc_offset(ffs_types::GroupNumber(0)),
+            Some(4096)
+        );
+    }
+
+    #[test]
+    fn group_desc_offset_4k_block_group_1() {
+        let parsed = parse_valid_sb_with_incompat(
+            Ext4IncompatFeatures::FILETYPE.0 | Ext4IncompatFeatures::EXTENTS.0,
+        );
+        assert_eq!(
+            parsed.group_desc_offset(ffs_types::GroupNumber(1)),
+            Some(4096 + 32) // group 1 offset = 4096 + desc_size
+        );
+    }
+
+    #[test]
+    fn group_desc_offset_1k_block() {
+        let mut sb = make_valid_sb();
+        sb[0x18..0x1C].copy_from_slice(&0_u32.to_le_bytes()); // log_block_size=0 → 1K
+        sb[0x1C..0x20].copy_from_slice(&0_u32.to_le_bytes()); // log_cluster_size=0
+        sb[0x14..0x18].copy_from_slice(&1_u32.to_le_bytes()); // first_data_block=1
+        sb[0x20..0x24].copy_from_slice(&8192_u32.to_le_bytes());
+        sb[0x24..0x28].copy_from_slice(&8192_u32.to_le_bytes());
+        let parsed = Ext4Superblock::parse_superblock_region(&sb).expect("parse");
+        // 1K blocks: GDT starts at block 2 = byte 2048
+        assert_eq!(
+            parsed.group_desc_offset(ffs_types::GroupNumber(0)),
+            Some(2048)
+        );
+    }
+
+    #[test]
+    fn inode_table_offset_root_inode() {
+        let parsed = parse_valid_sb_with_incompat(
+            Ext4IncompatFeatures::FILETYPE.0 | Ext4IncompatFeatures::EXTENTS.0,
+        );
+        let (group, index, byte_offset) =
+            parsed.inode_table_offset(ffs_types::InodeNumber::ROOT);
+        assert_eq!(group, ffs_types::GroupNumber(0));
+        // Root inode (2): index_in_group = (2-1) % 8192 = 1
+        assert_eq!(index, 1);
+        // byte_offset = index * inode_size = 1 * 256 = 256
+        assert_eq!(byte_offset, 256);
+    }
+
+    #[test]
+    fn inode_table_offset_first_inode() {
+        let parsed = parse_valid_sb_with_incompat(
+            Ext4IncompatFeatures::FILETYPE.0 | Ext4IncompatFeatures::EXTENTS.0,
+        );
+        let (group, index, byte_offset) =
+            parsed.inode_table_offset(ffs_types::InodeNumber(1));
+        assert_eq!(group, ffs_types::GroupNumber(0));
+        assert_eq!(index, 0);
+        assert_eq!(byte_offset, 0);
+    }
+
+    #[test]
+    fn parse_from_image_rejects_short_image() {
+        assert!(Ext4Superblock::parse_from_image(&[0; 1024]).is_err());
+        assert!(Ext4Superblock::parse_from_image(&[]).is_err());
+    }
+
+    #[test]
+    fn parse_from_image_extracts_from_offset_1024() {
+        // Build a valid image: 1024 zero bytes + 1024-byte superblock region
+        let mut image = vec![0_u8; 2048];
+        let sb = make_valid_sb();
+        image[1024..2048].copy_from_slice(&sb);
+        let parsed = Ext4Superblock::parse_from_image(&image).expect("parse from image");
+        assert_eq!(parsed.magic, EXT4_SUPER_MAGIC);
+        assert_eq!(parsed.block_size, 4096);
+    }
+
     // Reproduce any failing case with:
     // PROPTEST_CASES=1 PROPTEST_SEED=<seed> cargo test -p ffs-ondisk <test_name> -- --nocapture
     proptest! {
