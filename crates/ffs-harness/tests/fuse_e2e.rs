@@ -624,6 +624,118 @@ fn fuse_setattr_truncate() {
 
 #[test]
 #[ignore = "requires /dev/fuse"]
+fn fuse_setattr_chmod() {
+    with_rw_mount(|mnt| {
+        // hello.txt exists from create_test_image.
+        let path = mnt.join("hello.txt");
+        let orig_meta = fs::metadata(&path).expect("stat hello.txt");
+        let orig_mode = orig_meta.permissions().mode() & 0o7777;
+
+        // Change to 0o755.
+        let new_perms = fs::Permissions::from_mode(0o755);
+        fs::set_permissions(&path, new_perms).expect("chmod 755 via FUSE");
+
+        let meta = fs::metadata(&path).expect("stat after chmod");
+        assert_eq!(
+            meta.permissions().mode() & 0o7777,
+            0o755,
+            "permissions should be 0o755 after chmod (were 0o{orig_mode:o})"
+        );
+
+        // Change to 0o600.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .expect("chmod 600 via FUSE");
+
+        let meta = fs::metadata(&path).expect("stat after second chmod");
+        assert_eq!(
+            meta.permissions().mode() & 0o7777,
+            0o600,
+            "permissions should be 0o600 after second chmod"
+        );
+
+        // File should still be readable/writable by us since we own it.
+        let content = fs::read_to_string(&path).expect("read after chmod");
+        assert_eq!(content, "Hello from FrankenFS E2E!\n");
+    });
+}
+
+#[test]
+#[ignore = "requires /dev/fuse"]
+fn fuse_statfs_returns_valid_stats() {
+    if !fuse_available() {
+        eprintln!("FUSE prerequisites not met, skipping");
+        return;
+    }
+
+    let tmp = TempDir::new().expect("tmpdir");
+    let image = create_test_image(tmp.path());
+    let mnt = tmp.path().join("mnt");
+    fs::create_dir_all(&mnt).expect("create mountpoint");
+
+    let Some(_session) = try_mount_ffs(&image, &mnt) else {
+        return;
+    };
+
+    // Use `stat -f` to exercise the FUSE statfs handler and parse the output.
+    let out = Command::new("stat")
+        .args(["-f", "-c", "%s %b %f %a %c %d %l", mnt.to_str().unwrap()])
+        .output()
+        .expect("stat -f on mountpoint");
+    assert!(
+        out.status.success(),
+        "stat -f failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let fields: Vec<&str> = stdout.trim().split_whitespace().collect();
+    assert_eq!(
+        fields.len(),
+        7,
+        "expected 7 stat -f fields, got: {stdout:?}"
+    );
+
+    // Parse statfs fields: block_size blocks blocks_free blocks_avail files files_free namelen
+    let block_size: u64 = fields[0].parse().expect("parse block_size");
+    let blocks: u64 = fields[1].parse().expect("parse blocks");
+    let blocks_free: u64 = fields[2].parse().expect("parse blocks_free");
+    let blocks_avail: u64 = fields[3].parse().expect("parse blocks_avail");
+    let files: u64 = fields[4].parse().expect("parse files");
+    let files_free: u64 = fields[5].parse().expect("parse files_free");
+    let namelen: u64 = fields[6].parse().expect("parse namelen");
+
+    // Validate: block size should be a power of two in [1024, 65536].
+    assert!(
+        block_size.is_power_of_two() && (1024..=65536).contains(&block_size),
+        "block_size {block_size} should be a power-of-two in [1024, 65536]"
+    );
+
+    // Total blocks should be non-zero (we made a 4 MiB image).
+    assert!(blocks > 0, "total blocks should be > 0");
+
+    // Free blocks should not exceed total blocks.
+    assert!(
+        blocks_free <= blocks,
+        "free blocks ({blocks_free}) should be <= total ({blocks})"
+    );
+    assert!(
+        blocks_avail <= blocks,
+        "available blocks ({blocks_avail}) should be <= total ({blocks})"
+    );
+
+    // Total inodes should be non-zero.
+    assert!(files > 0, "total inodes should be > 0");
+    assert!(
+        files_free <= files,
+        "free inodes ({files_free}) should be <= total ({files})"
+    );
+
+    // Max filename length: ext4 is 255.
+    assert_eq!(namelen, 255, "ext4 max filename length should be 255");
+}
+
+#[test]
+#[ignore = "requires /dev/fuse"]
 fn fuse_write_large_file() {
     with_rw_mount(|mnt| {
         let path = mnt.join("large.bin");
