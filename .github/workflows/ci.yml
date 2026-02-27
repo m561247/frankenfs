@@ -56,6 +56,12 @@ jobs:
       - name: Unit tests
         run: cargo test --workspace
 
+      - name: ffs-block all-features check
+        run: cargo check -p ffs-block --all-features --all-targets
+
+      - name: ffs-block all-features tests
+        run: cargo test -p ffs-block --all-features
+
   # Golden verification requires fixture images which are large.
   # This job regenerates them from scratch for consistent verification.
   golden-verification:

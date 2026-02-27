@@ -3,10 +3,11 @@
 use asupersync::Cx;
 use ffs_core::{OpenFs, OpenOptions};
 use ffs_harness::{
+    GoldenReference, ParityReport,
     e2e::{CrashReplaySuiteConfig, FsxStressConfig, run_crash_replay_suite, run_fsx_stress},
-    GoldenReference, ParityReport, validate_btrfs_chunk_fixture, validate_btrfs_fixture,
-    validate_btrfs_leaf_fixture, validate_dir_block_fixture, validate_ext4_fixture,
-    validate_group_desc_fixture, validate_inode_fixture,
+    validate_btrfs_chunk_fixture, validate_btrfs_fixture, validate_btrfs_leaf_fixture,
+    validate_dir_block_fixture, validate_ext4_fixture, validate_group_desc_fixture,
+    validate_inode_fixture,
 };
 use serde_json::Value;
 use std::path::Path;

@@ -29,7 +29,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use tracing::{debug, info, trace, warn};
 
@@ -1996,7 +1996,7 @@ mod tests {
     use ffs_core::{DirEntry as FfsDirEntry, RequestScope};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::SystemTime;
+    use std::time::{Instant, SystemTime};
 
     /// Minimal FsOps stub for tests that don't need real filesystem behavior.
     struct StubFs;
