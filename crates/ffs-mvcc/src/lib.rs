@@ -248,7 +248,6 @@ pub enum CommitError {
 /// (checking if the committer's reads were invalidated by a *later*
 /// concurrent reader that also committed).
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct CommittedTxnRecord {
     pub(crate) txn_id: TxnId,
     pub(crate) commit_seq: CommitSeq,

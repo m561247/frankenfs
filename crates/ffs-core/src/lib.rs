@@ -288,7 +288,6 @@ struct Ext4AllocState {
     /// Per-group allocation statistics (block/inode counts, bitmap locations).
     groups: Vec<GroupStats>,
     /// On-disk persistence context for group descriptor updates.
-    #[allow(dead_code)]
     persist_ctx: PersistCtx,
 }
 
