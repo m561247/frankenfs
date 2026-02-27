@@ -688,7 +688,7 @@ fn fuse_statfs_returns_valid_stats() {
     );
 
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let fields: Vec<&str> = stdout.trim().split_whitespace().collect();
+    let fields: Vec<&str> = stdout.split_whitespace().collect();
     assert_eq!(
         fields.len(),
         7,
