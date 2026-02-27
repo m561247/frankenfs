@@ -237,10 +237,7 @@ pub fn primary_btrfs_superblock_block(block_size: u32) -> BlockNumber {
     BlockNumber((BTRFS_SUPER_INFO_OFFSET as u64) / u64::from(block_size))
 }
 
-pub fn report_has_error_or_higher_for_block(
-    report: &ScrubReport,
-    block: BlockNumber,
-) -> bool {
+pub fn report_has_error_or_higher_for_block(report: &ScrubReport, block: BlockNumber) -> bool {
     report
         .findings
         .iter()
@@ -818,9 +815,7 @@ pub fn build_ext4_repair_group_spec(
     })
 }
 
-pub fn build_ext4_repair_group_specs(
-    sb: &Ext4Superblock,
-) -> Result<Vec<Ext4RepairGroupSpec>> {
+pub fn build_ext4_repair_group_specs(sb: &Ext4Superblock) -> Result<Vec<Ext4RepairGroupSpec>> {
     let mut specs = Vec::with_capacity(usize::try_from(sb.groups_count()).unwrap_or(usize::MAX));
     for group in 0..sb.groups_count() {
         specs.push(build_ext4_repair_group_spec(sb, group)?);
@@ -1489,10 +1484,7 @@ pub fn scrub_range_for_repair(
 }
 
 #[allow(clippy::too_many_lines)]
-pub fn build_repair_output(
-    path: &PathBuf,
-    options: RepairCommandOptions,
-) -> Result<RepairOutput> {
+pub fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Result<RepairOutput> {
     let flags = options.flags;
     let cx = cli_cx();
     let mut limitations = Vec::new();

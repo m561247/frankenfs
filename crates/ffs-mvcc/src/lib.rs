@@ -6899,5 +6899,759 @@ mod tests {
                 );
             }
         }
+
+        /// Invariant: SSI detects write-skew (rw-antidependency cycles).
+        ///
+        /// Two concurrent transactions each read a block written by the other.
+        /// Under SSI, the second committer must be rejected because the read-write
+        /// dependency forms a dangerous cycle.
+        #[test]
+        fn proptest_ssi_detects_write_skew(
+            block_a in 0_u16..32,
+            block_b in 32_u16..64,
+            seed_a in any::<u8>(),
+            seed_b in any::<u8>(),
+        ) {
+            let mut store = MvccStore::new();
+            let ba = BlockNumber(u64::from(block_a));
+            let bb = BlockNumber(u64::from(block_b));
+
+            // Seed initial values so reads return something.
+            let mut seed = store.begin();
+            seed.stage_write(ba, vec![seed_a; 64]);
+            seed.stage_write(bb, vec![seed_b; 64]);
+            store.commit_ssi(seed).expect("seed commit");
+
+            // T1: reads block_b, writes block_a.
+            let mut t1 = store.begin();
+            t1.record_read(bb, CommitSeq(1));
+            t1.stage_write(ba, vec![seed_a.wrapping_add(1); 64]);
+
+            // T2: reads block_a, writes block_b.
+            let mut t2 = store.begin();
+            t2.record_read(ba, CommitSeq(1));
+            t2.stage_write(bb, vec![seed_b.wrapping_add(1); 64]);
+
+            // First committer succeeds (SSI).
+            store.commit_ssi(t1).expect("t1 SSI commit");
+
+            // Second committer must be rejected: rw-antidependency cycle.
+            let result = store.commit_ssi(t2);
+            prop_assert!(
+                result.is_err(),
+                "SSI should reject t2 due to write-skew on blocks {}, {}",
+                block_a, block_b,
+            );
+        }
+
+        /// Invariant: N concurrent writers to the same block — exactly one wins.
+        ///
+        /// For any number of concurrent transactions (2..8) all writing the same
+        /// block, exactly one commits successfully under FCW.
+        #[test]
+        fn proptest_n_concurrent_writers_exactly_one_wins(
+            n in 2_usize..8,
+            block_id in 0_u16..64,
+            bytes in prop::collection::vec(any::<u8>(), 2..8),
+        ) {
+            let mut store = MvccStore::new();
+            let block = BlockNumber(u64::from(block_id));
+            let writer_count = n.min(bytes.len());
+
+            // Begin all transactions at the same snapshot.
+            let mut txns: Vec<Transaction> = (0..writer_count)
+                .map(|_| store.begin())
+                .collect();
+
+            // Each stages a write to the same block with different data.
+            for (i, txn) in txns.iter_mut().enumerate() {
+                txn.stage_write(block, vec![bytes[i]; 64]);
+            }
+
+            // Commit all — count successes and failures.
+            let mut successes = 0_usize;
+            let mut failures = 0_usize;
+            for txn in txns {
+                match store.commit(txn) {
+                    Ok(_) => successes += 1,
+                    Err(CommitError::Conflict { .. }) => failures += 1,
+                    Err(other) => prop_assert!(false, "unexpected error: {:?}", other),
+                }
+            }
+
+            prop_assert_eq!(successes, 1, "exactly one writer should succeed");
+            prop_assert_eq!(failures, writer_count - 1, "rest should conflict");
+        }
+
+        /// Invariant: prune_safe preserves active snapshot visibility.
+        ///
+        /// After registering a snapshot and pruning, all blocks visible to that
+        /// snapshot before pruning must still be visible after pruning.
+        #[test]
+        fn proptest_prune_safe_preserves_active_snapshot(
+            ops in write_ops_strategy(),
+            extra_commits in 1_usize..6,
+        ) {
+            let mut store = MvccStore::new();
+
+            // Commit initial data.
+            let mut txn = store.begin();
+            for &(block, byte) in &ops {
+                txn.stage_write(BlockNumber(u64::from(block)), vec![byte; 64]);
+            }
+            store.commit(txn).expect("initial commit");
+
+            // Register a snapshot at current state.
+            let snap = store.current_snapshot();
+            store.register_snapshot(snap);
+
+            // Record what's visible before additional commits and pruning.
+            let mut expected = std::collections::BTreeMap::<u16, u8>::new();
+            for &(block, byte) in &ops {
+                expected.insert(block, byte);
+            }
+
+            // Commit more data (potentially overwriting same blocks).
+            for i in 0..extra_commits {
+                let mut txn = store.begin();
+                for &(block, _) in &ops {
+                    #[allow(clippy::cast_possible_truncation)]
+                    txn.stage_write(
+                        BlockNumber(u64::from(block)),
+                        vec![(i as u8).wrapping_add(100); 64],
+                    );
+                }
+                store.commit(txn).expect("extra commit");
+            }
+
+            // Prune — should respect the registered snapshot.
+            store.prune_safe();
+
+            // The registered snapshot must still see the original values.
+            for (&block, &byte) in &expected {
+                let data = store
+                    .read_visible(BlockNumber(u64::from(block)), snap)
+                    .expect("snapshot visibility must survive pruning");
+                prop_assert_eq!(
+                    data[0], byte,
+                    "prune_safe violated snapshot visibility for block {}",
+                    block,
+                );
+            }
+
+            store.release_snapshot(snap);
+        }
+
+        /// Invariant: version chain integrity after pruning — the latest version
+        /// for each block is always preserved by GC.
+        #[test]
+        fn proptest_latest_version_survives_pruning(
+            num_writes in 2_usize..12,
+            block_id in 0_u16..32,
+        ) {
+            let mut store = MvccStore::new();
+            let block = BlockNumber(u64::from(block_id));
+
+            let mut last_byte: u8 = 0;
+            for i in 0..num_writes {
+                let mut txn = store.begin();
+                #[allow(clippy::cast_possible_truncation)]
+                let byte = i as u8;
+                txn.stage_write(block, vec![byte; 64]);
+                store.commit(txn).expect("commit");
+                last_byte = byte;
+            }
+
+            // Prune everything possible (no active snapshots).
+            store.prune_safe();
+
+            // The latest version must still be readable.
+            let snap = store.current_snapshot();
+            let data = store
+                .read_visible(block, snap)
+                .expect("latest version must survive pruning");
+            prop_assert_eq!(
+                data[0], last_byte,
+                "latest version lost after pruning for block {}",
+                block_id,
+            );
+        }
+
+        /// Invariant: multi-block transaction atomicity — all writes in a
+        /// committed transaction are visible together; no partial state.
+        #[test]
+        fn proptest_multi_block_transaction_all_or_nothing(
+            blocks in prop::collection::vec(0_u16..128, 2..16),
+            data_byte in any::<u8>(),
+        ) {
+            let mut store = MvccStore::new();
+
+            let unique_blocks: BTreeSet<u16> = blocks.iter().copied().collect();
+
+            let mut txn = store.begin();
+            for &block in &unique_blocks {
+                txn.stage_write(BlockNumber(u64::from(block)), vec![data_byte; 64]);
+            }
+            store.commit(txn).expect("multi-block commit");
+
+            // All blocks must be visible as a group — no partial state.
+            let snap = store.current_snapshot();
+            for &block in &unique_blocks {
+                let data = store
+                    .read_visible(BlockNumber(u64::from(block)), snap)
+                    .expect("all committed blocks must be visible");
+                prop_assert_eq!(
+                    data[0], data_byte,
+                    "partial visibility for block {}",
+                    block,
+                );
+            }
+        }
+
+        /// Invariant: interleaved serial transactions preserve all committed data.
+        ///
+        /// A sequence of transactions writing to random blocks, committed one after
+        /// another, must result in every block having the value from its last writer.
+        #[test]
+        fn proptest_interleaved_serial_no_lost_updates(
+            txn_ops in prop::collection::vec(
+                prop::collection::vec((0_u16..32, any::<u8>()), 1..8),
+                2..10,
+            ),
+        ) {
+            let mut store = MvccStore::new();
+
+            // Track expected final state: last write per block across all txns.
+            let mut expected = std::collections::BTreeMap::<u16, u8>::new();
+
+            for ops in &txn_ops {
+                let mut txn = store.begin();
+                for &(block, byte) in ops {
+                    txn.stage_write(BlockNumber(u64::from(block)), vec![byte; 64]);
+                    expected.insert(block, byte);
+                }
+                store.commit(txn).expect("serial commit");
+            }
+
+            // Verify final state matches expected.
+            let snap = store.current_snapshot();
+            for (&block, &byte) in &expected {
+                let data = store
+                    .read_visible(BlockNumber(u64::from(block)), snap)
+                    .expect("committed block must be visible");
+                prop_assert_eq!(
+                    data[0], byte,
+                    "lost update for block {} (expected {}, got {})",
+                    block, byte, data[0],
+                );
+            }
+        }
+    }
+
+    // ── Conflict detection edge-case tests ─────────────────────────────
+
+    /// FCW: a write committed at exactly snapshot.high is NOT a conflict.
+    /// Only writes with commit_seq > snapshot.high cause rejection.
+    #[test]
+    fn fcw_write_at_snapshot_boundary_is_not_conflict() {
+        let mut store = MvccStore::new();
+
+        // T1: write block 0, commits at seq 1.
+        let mut t1 = store.begin();
+        t1.stage_write(BlockNumber(0), vec![1; 64]);
+        let seq1 = store.commit(t1).expect("t1 commit");
+
+        // T2: begins AFTER t1 committed → snapshot.high == seq1.
+        let mut t2 = store.begin();
+        assert_eq!(t2.snapshot.high, seq1);
+        t2.stage_write(BlockNumber(0), vec![2; 64]);
+
+        // latest_commit_seq(block 0) == seq1 == snapshot.high → NOT > → OK.
+        assert!(store.commit(t2).is_ok());
+    }
+
+    /// FCW: a write committed AFTER snapshot.high IS a conflict.
+    #[test]
+    fn fcw_write_after_snapshot_boundary_is_conflict() {
+        let mut store = MvccStore::new();
+
+        // T1 begins.
+        let mut t1 = store.begin();
+        t1.stage_write(BlockNumber(0), vec![1; 64]);
+
+        // T2 begins concurrently (same snapshot as T1).
+        let mut t2 = store.begin();
+        t2.stage_write(BlockNumber(0), vec![2; 64]);
+
+        // T1 commits first → advances latest for block 0.
+        store.commit(t1).expect("t1 commit");
+
+        // T2 commits → latest_commit_seq(block 0) > t2.snapshot.high → Conflict.
+        let err = store.commit(t2).unwrap_err();
+        assert!(
+            matches!(err, CommitError::Conflict { block, .. } if block == BlockNumber(0)),
+            "expected Conflict on block 0, got {err:?}"
+        );
+    }
+
+    /// FCW conflict reports correct block, snapshot, and observed commit seq.
+    #[test]
+    fn fcw_conflict_error_contains_correct_fields() {
+        let mut store = MvccStore::new();
+
+        let mut t2 = store.begin(); // snapshot.high == 0
+        t2.stage_write(BlockNumber(7), vec![2; 32]);
+
+        let mut t1 = store.begin();
+        t1.stage_write(BlockNumber(7), vec![1; 32]);
+        let seq1 = store.commit(t1).expect("t1");
+
+        let err = store.commit(t2).unwrap_err();
+        match err {
+            CommitError::Conflict {
+                block,
+                snapshot,
+                observed,
+            } => {
+                assert_eq!(block, BlockNumber(7));
+                assert_eq!(snapshot, CommitSeq(0));
+                assert_eq!(observed, seq1);
+            }
+            other => panic!("expected Conflict, got {other:?}"),
+        }
+    }
+
+    /// FCW: three concurrent writers to same block — first wins, others conflict.
+    #[test]
+    fn fcw_three_concurrent_all_but_first_conflict() {
+        let mut store = MvccStore::new();
+
+        let mut t1 = store.begin();
+        let mut t2 = store.begin();
+        let mut t3 = store.begin();
+
+        t1.stage_write(BlockNumber(0), vec![1; 16]);
+        t2.stage_write(BlockNumber(0), vec![2; 16]);
+        t3.stage_write(BlockNumber(0), vec![3; 16]);
+
+        assert!(store.commit(t1).is_ok());
+        assert!(matches!(
+            store.commit(t2),
+            Err(CommitError::Conflict { .. })
+        ));
+        assert!(matches!(
+            store.commit(t3),
+            Err(CommitError::Conflict { .. })
+        ));
+    }
+
+    /// FCW: concurrent writers to DIFFERENT blocks all succeed.
+    #[test]
+    fn fcw_concurrent_disjoint_blocks_all_succeed() {
+        let mut store = MvccStore::new();
+
+        let mut t1 = store.begin();
+        let mut t2 = store.begin();
+        let mut t3 = store.begin();
+
+        t1.stage_write(BlockNumber(10), vec![1; 16]);
+        t2.stage_write(BlockNumber(20), vec![2; 16]);
+        t3.stage_write(BlockNumber(30), vec![3; 16]);
+
+        assert!(store.commit(t1).is_ok());
+        assert!(store.commit(t2).is_ok());
+        assert!(store.commit(t3).is_ok());
+    }
+
+    /// SSI: read-only transaction (no writes) always commits regardless of
+    /// concurrent activity.
+    #[test]
+    fn ssi_read_only_txn_always_commits() {
+        let mut store = MvccStore::new();
+
+        let mut seed = store.begin();
+        seed.stage_write(BlockNumber(0), vec![1; 64]);
+        store.commit_ssi(seed).expect("seed");
+
+        // T1 reads block 0 but writes nothing.
+        let mut t1 = store.begin();
+        t1.record_read(BlockNumber(0), CommitSeq(1));
+
+        // Concurrent T2 writes block 0.
+        let mut t2 = store.begin();
+        t2.stage_write(BlockNumber(0), vec![2; 64]);
+        store.commit_ssi(t2).expect("t2");
+
+        // T1 (read-only) commits — validate_ssi_read_set Ok(0) when writes empty.
+        assert!(store.commit_ssi(t1).is_ok());
+    }
+
+    /// SSI: transaction writes block A and reads block B. Concurrent write
+    /// to B → conflict.
+    #[test]
+    fn ssi_write_skew_on_read_block() {
+        let mut store = MvccStore::new();
+
+        let mut seed = store.begin();
+        seed.stage_write(BlockNumber(0), vec![0; 64]);
+        seed.stage_write(BlockNumber(1), vec![0; 64]);
+        store.commit_ssi(seed).expect("seed");
+
+        // T1: reads block 1, writes block 0.
+        let mut t1 = store.begin();
+        t1.record_read(BlockNumber(1), store.latest_commit_seq(BlockNumber(1)));
+        t1.stage_write(BlockNumber(0), vec![1; 64]);
+
+        // T2: writes block 1 and commits first.
+        let mut t2 = store.begin();
+        t2.stage_write(BlockNumber(1), vec![2; 64]);
+        store.commit_ssi(t2).expect("t2");
+
+        // T1: rejected due to SSI conflict on block 1.
+        let err = store.commit_ssi(t1).unwrap_err();
+        assert!(
+            matches!(err, CommitError::SsiConflict { pivot_block, .. } if pivot_block == BlockNumber(1)),
+            "expected SsiConflict on block 1, got {err:?}"
+        );
+    }
+
+    /// SSI: write-write conflict is caught by FCW layer before SSI check.
+    #[test]
+    fn ssi_fcw_conflict_takes_precedence_over_ssi() {
+        let mut store = MvccStore::new();
+
+        let mut t1 = store.begin();
+        let mut t2 = store.begin();
+
+        t1.stage_write(BlockNumber(5), vec![1; 64]);
+        t2.stage_write(BlockNumber(5), vec![2; 64]);
+
+        store.commit_ssi(t1).expect("t1");
+
+        let err = store.commit_ssi(t2).unwrap_err();
+        assert!(
+            matches!(err, CommitError::Conflict { block, .. } if block == BlockNumber(5)),
+            "expected FCW Conflict, got {err:?}"
+        );
+    }
+
+    /// SSI: transaction reads and writes the same block — no self-conflict.
+    #[test]
+    fn ssi_self_read_write_no_conflict() {
+        let mut store = MvccStore::new();
+
+        let mut seed = store.begin();
+        seed.stage_write(BlockNumber(0), vec![0; 64]);
+        store.commit_ssi(seed).expect("seed");
+
+        let mut t1 = store.begin();
+        t1.record_read(BlockNumber(0), store.latest_commit_seq(BlockNumber(0)));
+        t1.stage_write(BlockNumber(0), vec![1; 64]);
+        assert!(store.commit_ssi(t1).is_ok());
+    }
+
+    /// SSI: T2 wrote block 0 (in T1's read set) → T1 gets SsiConflict.
+    #[test]
+    fn ssi_overlapping_read_write_sets_detected() {
+        let mut store = MvccStore::new();
+
+        let mut seed = store.begin();
+        seed.stage_write(BlockNumber(0), vec![0; 64]);
+        seed.stage_write(BlockNumber(1), vec![0; 64]);
+        seed.stage_write(BlockNumber(2), vec![0; 64]);
+        seed.stage_write(BlockNumber(3), vec![0; 64]);
+        store.commit_ssi(seed).expect("seed");
+
+        // T1: reads {0, 1}, writes {2}.
+        let mut t1 = store.begin();
+        t1.record_read(BlockNumber(0), store.latest_commit_seq(BlockNumber(0)));
+        t1.record_read(BlockNumber(1), store.latest_commit_seq(BlockNumber(1)));
+        t1.stage_write(BlockNumber(2), vec![1; 64]);
+
+        // T2: reads {2, 3}, writes {0}. Commits first.
+        let mut t2 = store.begin();
+        t2.record_read(BlockNumber(2), store.latest_commit_seq(BlockNumber(2)));
+        t2.record_read(BlockNumber(3), store.latest_commit_seq(BlockNumber(3)));
+        t2.stage_write(BlockNumber(0), vec![2; 64]);
+        store.commit_ssi(t2).expect("t2");
+
+        // T1 fails: T2 wrote block 0, which is in T1's read set.
+        let err = store.commit_ssi(t1).unwrap_err();
+        assert!(
+            matches!(err, CommitError::SsiConflict { pivot_block, .. } if pivot_block == BlockNumber(0)),
+            "expected SsiConflict on block 0, got {err:?}"
+        );
+    }
+
+    /// Chain backpressure: version chain at critical length with snapshot
+    /// pin → rejection. Register the snapshot twice so force_advance only
+    /// decrements the refcount without fully removing the pin.
+    #[test]
+    fn chain_backpressure_rejects_at_critical_with_snapshot_pin() {
+        // cap=2 → critical = max(2*4, 2+1) = 8.
+        let policy = CompressionPolicy {
+            max_chain_length: Some(2),
+            dedup_identical: false,
+            algo: CompressionAlgo::None,
+        };
+        let mut store = MvccStore::with_compression_policy(policy);
+
+        let pin_snap = store.current_snapshot();
+        // Double-register so force_advance_oldest_snapshot only decrements
+        // the refcount but does NOT remove the pin entirely.
+        store.register_snapshot(pin_snap);
+        store.register_snapshot(pin_snap);
+
+        for i in 0..8_u8 {
+            let mut txn = store.begin();
+            txn.stage_write(BlockNumber(0), vec![i; 64]);
+            store.commit(txn).expect("build chain");
+        }
+
+        let mut txn = store.begin();
+        txn.stage_write(BlockNumber(0), vec![99; 64]);
+        let err = store.commit(txn).unwrap_err();
+        assert!(
+            matches!(err, CommitError::ChainBackpressure { block, .. } if block == BlockNumber(0)),
+            "expected ChainBackpressure on block 0, got {err:?}"
+        );
+
+        store.release_snapshot(pin_snap);
+        store.release_snapshot(pin_snap);
+    }
+
+    /// Chain backpressure: without snapshot pin, chain is trimmed and commit
+    /// succeeds.
+    #[test]
+    fn chain_pressure_without_snapshot_pin_allows_commit() {
+        let policy = CompressionPolicy {
+            max_chain_length: Some(2),
+            dedup_identical: false,
+            algo: CompressionAlgo::None,
+        };
+        let mut store = MvccStore::with_compression_policy(policy);
+
+        for i in 0..8_u8 {
+            let mut txn = store.begin();
+            txn.stage_write(BlockNumber(0), vec![i; 64]);
+            store.commit(txn).expect("build chain");
+        }
+
+        let mut txn = store.begin();
+        txn.stage_write(BlockNumber(0), vec![99; 64]);
+        assert!(store.commit(txn).is_ok());
+    }
+
+    /// Chain backpressure: force-advance oldest snapshot exercises the
+    /// recovery path.
+    #[test]
+    fn chain_pressure_force_advance_exercises_recovery() {
+        let policy = CompressionPolicy {
+            max_chain_length: Some(2),
+            dedup_identical: false,
+            algo: CompressionAlgo::None,
+        };
+        let mut store = MvccStore::with_compression_policy(policy);
+
+        let oldest_snap = store.current_snapshot();
+        store.register_snapshot(oldest_snap);
+
+        for i in 0..4_u8 {
+            let mut txn = store.begin();
+            txn.stage_write(BlockNumber(0), vec![i; 64]);
+            store.commit(txn).expect("build chain");
+        }
+
+        let newer_snap = store.current_snapshot();
+        store.register_snapshot(newer_snap);
+
+        for i in 4..8_u8 {
+            let mut txn = store.begin();
+            txn.stage_write(BlockNumber(0), vec![i; 64]);
+            store.commit(txn).expect("continue chain");
+        }
+
+        // Force-advance mechanism is exercised. Result depends on whether
+        // newer_snap still blocks trimming.
+        let mut txn = store.begin();
+        txn.stage_write(BlockNumber(0), vec![99; 64]);
+        let _ = store.commit(txn);
+
+        store.release_snapshot(oldest_snap);
+        store.release_snapshot(newer_snap);
+    }
+
+    /// SSI log boundary: commit_seq exactly at snapshot.high is NOT scanned
+    /// as a conflict.
+    #[test]
+    fn ssi_log_entry_at_snapshot_high_not_conflict() {
+        let mut store = MvccStore::new();
+
+        let mut seed = store.begin();
+        seed.stage_write(BlockNumber(0), vec![0; 64]);
+        seed.stage_write(BlockNumber(1), vec![0; 64]);
+        let seq_seed = store.commit_ssi(seed).expect("seed");
+
+        // T1 begins — snapshot.high == seq_seed.
+        let mut t1 = store.begin();
+        assert_eq!(t1.snapshot.high, seq_seed);
+        t1.record_read(BlockNumber(0), seq_seed);
+        t1.stage_write(BlockNumber(1), vec![1; 64]);
+
+        // SSI log entry from seed has commit_seq == seq_seed == t1.snapshot.high.
+        // Scan breaks at `record.commit_seq <= txn.snapshot.high`.
+        assert!(store.commit_ssi(t1).is_ok());
+    }
+
+    /// Empty transaction commits without conflict under both FCW and SSI.
+    #[test]
+    fn empty_txn_commits_under_fcw_and_ssi() {
+        let mut store = MvccStore::new();
+
+        let mut seed = store.begin();
+        seed.stage_write(BlockNumber(0), vec![1; 64]);
+        store.commit(seed).expect("seed");
+
+        let t1 = store.begin();
+        assert!(store.commit(t1).is_ok());
+
+        let t2 = store.begin();
+        assert!(store.commit_ssi(t2).is_ok());
+    }
+
+    /// FCW: multi-block transaction fails on first conflicting block.
+    #[test]
+    fn fcw_multi_block_fails_on_conflicting_block() {
+        let mut store = MvccStore::new();
+
+        let mut t1 = store.begin();
+        t1.stage_write(BlockNumber(5), vec![1; 16]);
+
+        let mut t2 = store.begin();
+        t2.stage_write(BlockNumber(3), vec![2; 16]);
+        t2.stage_write(BlockNumber(5), vec![2; 16]);
+        t2.stage_write(BlockNumber(7), vec![2; 16]);
+
+        store.commit(t1).expect("t1");
+
+        let err = store.commit(t2).unwrap_err();
+        assert!(
+            matches!(err, CommitError::Conflict { block, .. } if block == BlockNumber(5)),
+            "expected Conflict on block 5, got {err:?}"
+        );
+    }
+
+    /// SSI: prune_ssi_log with exact boundary — records at prune_seq removed.
+    #[test]
+    fn ssi_prune_log_exact_boundary() {
+        let mut store = MvccStore::new();
+
+        let mut t1 = store.begin();
+        t1.stage_write(BlockNumber(0), vec![1; 32]);
+        store.commit_ssi(t1).expect("t1");
+
+        let mut t2 = store.begin();
+        t2.stage_write(BlockNumber(1), vec![2; 32]);
+        let seq2 = store.commit_ssi(t2).expect("t2");
+
+        let mut t3 = store.begin();
+        t3.stage_write(BlockNumber(2), vec![3; 32]);
+        let seq3 = store.commit_ssi(t3).expect("t3");
+
+        store.prune_ssi_log(seq2);
+
+        assert_eq!(store.ssi_log.len(), 1);
+        assert_eq!(store.ssi_log[0].commit_seq, seq3);
+    }
+
+    /// Versions eligible at watermark: empty store → 0 eligible.
+    #[test]
+    fn versions_eligible_empty_store() {
+        let store = MvccStore::new();
+        assert_eq!(store.versions_eligible_at_watermark(CommitSeq(100)), 0);
+    }
+
+    /// Versions eligible: single version per block → 0 (never trim last).
+    #[test]
+    fn versions_eligible_single_version_is_zero() {
+        let mut store = MvccStore::new();
+        let mut txn = store.begin();
+        txn.stage_write(BlockNumber(0), vec![1; 64]);
+        store.commit(txn).expect("commit");
+
+        assert_eq!(store.versions_eligible_at_watermark(CommitSeq(100)), 0);
+    }
+
+    /// Versions eligible: multi-version chain — all but latest below watermark.
+    #[test]
+    fn versions_eligible_multi_version_chain() {
+        let mut store = MvccStore::new();
+
+        for i in 0..5_u8 {
+            let mut txn = store.begin();
+            txn.stage_write(BlockNumber(0), vec![i; 64]);
+            store.commit(txn).expect("commit");
+        }
+
+        // 5 versions at seqs 1..=5. Watermark 100 → 4 eligible.
+        assert_eq!(store.versions_eligible_at_watermark(CommitSeq(100)), 4);
+        // Watermark 0 → 0 eligible.
+        assert_eq!(store.versions_eligible_at_watermark(CommitSeq(0)), 0);
+    }
+
+    /// latest_commit_seq returns CommitSeq(0) for an unwritten block.
+    #[test]
+    fn latest_commit_seq_unwritten_returns_zero() {
+        let store = MvccStore::new();
+        assert_eq!(store.latest_commit_seq(BlockNumber(999)), CommitSeq(0));
+    }
+
+    /// latest_commit_seq tracks the most recent commit.
+    #[test]
+    fn latest_commit_seq_tracks_most_recent_write() {
+        let mut store = MvccStore::new();
+
+        let mut t1 = store.begin();
+        t1.stage_write(BlockNumber(0), vec![1; 64]);
+        let seq1 = store.commit(t1).expect("t1");
+        assert_eq!(store.latest_commit_seq(BlockNumber(0)), seq1);
+
+        let mut t2 = store.begin();
+        t2.stage_write(BlockNumber(0), vec![2; 64]);
+        let seq2 = store.commit(t2).expect("t2");
+        assert_eq!(store.latest_commit_seq(BlockNumber(0)), seq2);
+        assert!(seq2 > seq1);
+    }
+
+    /// critical_chain_len is always strictly greater than max_len.
+    #[test]
+    fn critical_chain_len_exceeds_cap_values() {
+        assert_eq!(MvccStore::critical_chain_len(1), 4);
+        assert_eq!(MvccStore::critical_chain_len(2), 8);
+        assert_eq!(MvccStore::critical_chain_len(0), 4);
+        assert_eq!(MvccStore::critical_chain_len(64), 256);
+    }
+
+    /// SSI: concurrent read-only transactions never conflict.
+    #[test]
+    fn ssi_concurrent_read_only_no_conflict() {
+        let mut store = MvccStore::new();
+
+        let mut seed = store.begin();
+        seed.stage_write(BlockNumber(0), vec![1; 64]);
+        seed.stage_write(BlockNumber(1), vec![2; 64]);
+        store.commit_ssi(seed).expect("seed");
+
+        let mut readers = Vec::new();
+        for _ in 0..5 {
+            let mut t = store.begin();
+            t.record_read(BlockNumber(0), store.latest_commit_seq(BlockNumber(0)));
+            t.record_read(BlockNumber(1), store.latest_commit_seq(BlockNumber(1)));
+            readers.push(t);
+        }
+
+        for t in readers {
+            assert!(store.commit_ssi(t).is_ok());
+        }
     }
 }

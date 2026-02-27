@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
+/// Degradation, backpressure, and compute-budget management for graceful overload handling.
 pub mod degradation;
+/// VFS semantics layer: filesystem-agnostic types and the [`vfs::FsOps`] trait.
 pub mod vfs;
 
 pub use degradation::{
@@ -57,16 +59,24 @@ use tracing::{debug, error, info, trace, warn};
 // Degradation/pressure types are in degradation.rs, re-exported above.
 // VFS types and FsOps trait are in vfs.rs, re-exported above.
 
+/// Detected filesystem type with the parsed superblock embedded.
+///
+/// Returned by [`detect_filesystem`] and stored in [`OpenFs::flavor`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FsFlavor {
+    /// ext4 filesystem with its parsed superblock.
     Ext4(Ext4Superblock),
+    /// btrfs filesystem with its parsed superblock.
     Btrfs(BtrfsSuperblock),
 }
 
+/// Error from filesystem detection (superblock probing).
 #[derive(Debug, Error)]
 pub enum DetectionError {
+    /// The image does not contain a recognized ext4 or btrfs superblock.
     #[error("image does not decode as supported ext4/btrfs superblock")]
     UnsupportedImage,
+    /// An I/O error occurred while reading the image.
     #[error("I/O error while probing image: {0}")]
     Io(#[from] FfsError),
 }
@@ -101,6 +111,7 @@ pub struct Ext4OrphanList {
 }
 
 impl Ext4OrphanList {
+    /// Number of inodes in the orphan list.
     #[must_use]
     pub fn count(&self) -> usize {
         self.inodes.len()
@@ -122,6 +133,9 @@ impl Ext4OrphanRecoveryStats {
     }
 }
 
+/// Probe an in-memory image for ext4 or btrfs superblock magic.
+///
+/// Tries ext4 first, then btrfs. Returns the first successful parse.
 pub fn detect_filesystem(image: &[u8]) -> Result<FsFlavor, DetectionError> {
     if let Ok(ext4) = Ext4Superblock::parse_from_image(image) {
         return Ok(FsFlavor::Ext4(ext4));
@@ -134,6 +148,10 @@ pub fn detect_filesystem(image: &[u8]) -> Result<FsFlavor, DetectionError> {
     Err(DetectionError::UnsupportedImage)
 }
 
+/// Probe a block device for ext4 or btrfs superblock magic.
+///
+/// Reads the superblock regions from the device and tries to parse them.
+/// Useful when the full image is not memory-mapped.
 pub fn detect_filesystem_on_device(
     cx: &Cx,
     dev: &dyn ByteDevice,
@@ -165,6 +183,9 @@ pub fn detect_filesystem_on_device(
     Err(DetectionError::UnsupportedImage)
 }
 
+/// Probe a filesystem image file at `path` for ext4 or btrfs superblock magic.
+///
+/// Convenience wrapper around [`detect_filesystem_on_device`] that opens the file.
 pub fn detect_filesystem_at_path(
     cx: &Cx,
     path: impl AsRef<Path>,
@@ -7718,9 +7739,15 @@ pub fn verify_ext4_integrity(image: &[u8], max_inodes: u32) -> Result<IntegrityR
     })
 }
 
+/// Beta-distributed posterior for per-block corruption probability.
+///
+/// Uses a conjugate Beta-Binomial model: `alpha` counts corrupt observations,
+/// `beta` counts clean observations. Starts with a uniform prior (1, 1).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct DurabilityPosterior {
+    /// Corrupt observation count (Beta distribution alpha parameter).
     pub alpha: f64,
+    /// Clean observation count (Beta distribution beta parameter).
     pub beta: f64,
 }
 
@@ -7754,11 +7781,13 @@ impl DurabilityPosterior {
         self.beta += clean;
     }
 
+    /// Posterior mean corruption rate: `alpha / (alpha + beta)`.
     #[must_use]
     pub fn expected_corruption_rate(&self) -> f64 {
         self.alpha / (self.alpha + self.beta)
     }
 
+    /// Posterior variance of the corruption rate estimate.
     #[must_use]
     pub fn variance(&self) -> f64 {
         let a = self.alpha;
@@ -7771,10 +7800,17 @@ impl DurabilityPosterior {
     }
 }
 
+/// Cost model for the durability autopilot's overhead decision.
+///
+/// Balances the cost of unrecoverable corruption against the storage cost of
+/// redundancy (RaptorQ repair symbols).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct DurabilityLossModel {
+    /// Expected cost of unrecoverable corruption per event.
     pub corruption_cost: f64,
+    /// Cost per unit of redundancy overhead.
     pub redundancy_cost: f64,
+    /// Number of standard deviations above the mean for conservative bound.
     pub z_score: f64,
 }
 
@@ -7788,18 +7824,30 @@ impl Default for DurabilityLossModel {
     }
 }
 
+/// Output of the durability autopilot's overhead selection.
+///
+/// Contains the chosen repair overhead ratio and the loss components that
+/// justified the decision.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct RedundancyDecision {
+    /// Chosen RaptorQ repair overhead (e.g. 1.05 = 5% overhead).
     pub repair_overhead: f64,
+    /// Expected total loss (redundancy cost + corruption risk cost).
     pub expected_loss: f64,
+    /// Posterior mean corruption rate from the Beta model.
     pub posterior_mean_corruption_rate: f64,
+    /// Conservative (z-score) upper bound on corruption rate.
     pub posterior_hi_corruption_rate: f64,
+    /// Chernoff bound on probability of unrecoverable data loss.
     pub unrecoverable_risk_bound: f64,
+    /// Cost component from redundancy overhead.
     pub redundancy_loss: f64,
+    /// Cost component from corruption risk.
     pub corruption_loss: f64,
 }
 
 impl RedundancyDecision {
+    /// Convert this decision into a [`RaptorQConfig`] for the encoding layer.
     #[must_use]
     pub fn to_raptorq_config(self, block_size: u32) -> RaptorQConfig {
         let mut cfg = RaptorQConfig::default();
@@ -7810,6 +7858,11 @@ impl RedundancyDecision {
     }
 }
 
+/// Adaptive controller that tunes RaptorQ repair overhead based on observed corruption.
+///
+/// Maintains a [`DurabilityPosterior`] (Beta model) updated from scrub results
+/// and uses a [`DurabilityLossModel`] to pick the overhead that minimises
+/// expected total loss (redundancy cost + corruption risk).
 #[derive(Debug, Clone, Default)]
 pub struct DurabilityAutopilot {
     posterior: DurabilityPosterior,
@@ -7817,25 +7870,30 @@ pub struct DurabilityAutopilot {
 }
 
 impl DurabilityAutopilot {
+    /// Create a new autopilot with uniform prior and default loss model.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Record a single corruption/clean observation.
     pub fn observe_event(&mut self, corruption_event: bool) {
         self.posterior.observe_event(corruption_event);
     }
 
+    /// Record a scrub pass with `scanned_blocks` checked and `corrupted_blocks` corrupt.
     pub fn observe_scrub(&mut self, scanned_blocks: u64, corrupted_blocks: u64) {
         self.posterior
             .observe_blocks(scanned_blocks, corrupted_blocks);
     }
 
+    /// Choose the best repair overhead from `candidates` for a default-sized group.
     #[must_use]
     pub fn choose_overhead(&self, candidates: &[f64]) -> RedundancyDecision {
         self.choose_overhead_for_group(candidates, 32_768)
     }
 
+    /// Choose the best repair overhead from `candidates` for a group of `source_block_count` blocks.
     #[must_use]
     pub fn choose_overhead_for_group(
         &self,
@@ -7979,12 +8037,17 @@ impl RepairPolicy {
     }
 }
 
+/// Top-level facade that wraps MVCC, parsing, and image inspection.
+///
+/// Provides a single entry-point for callers that want transactional block
+/// access without constructing lower-level components directly.
 #[derive(Debug, Default)]
 pub struct FrankenFsEngine {
     store: MvccStore,
 }
 
 impl FrankenFsEngine {
+    /// Create a new engine with an empty MVCC store.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -7992,19 +8055,23 @@ impl FrankenFsEngine {
         }
     }
 
+    /// Begin a new read-write transaction.
     pub fn begin(&mut self) -> Transaction {
         self.store.begin()
     }
 
+    /// Commit a transaction using First-Committer-Wins conflict detection.
     pub fn commit(&mut self, txn: Transaction) -> Result<CommitSeq, CommitError> {
         self.store.commit(txn)
     }
 
+    /// Return the current global snapshot for read-only access.
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
         self.store.current_snapshot()
     }
 
+    /// Read the version of `block` visible at `snapshot`, if any.
     #[must_use]
     pub fn read(
         &self,
@@ -8014,18 +8081,22 @@ impl FrankenFsEngine {
         self.store.read_visible(block, snapshot)
     }
 
+    /// Check the cancellation token on `cx`. Returns `Err` if cancelled.
     pub fn checkpoint(cx: &Cx) -> Result<(), Box<asupersync::Error>> {
         cx.checkpoint().map_err(Box::new)
     }
 
+    /// Detect whether `image` is ext4 or btrfs.
     pub fn inspect_image(image: &[u8]) -> Result<FsFlavor, DetectionError> {
         detect_filesystem(image)
     }
 
+    /// Parse the ext4 superblock from an in-memory image.
     pub fn parse_ext4(image: &[u8]) -> Result<Ext4Superblock, ParseError> {
         Ext4Superblock::parse_from_image(image)
     }
 
+    /// Parse the btrfs superblock from an in-memory image.
     pub fn parse_btrfs(image: &[u8]) -> Result<BtrfsSuperblock, ParseError> {
         BtrfsSuperblock::parse_from_image(image)
     }

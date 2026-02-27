@@ -163,6 +163,7 @@ pub struct RequestScope {
 }
 
 impl RequestScope {
+    /// Create a scope with no snapshot or transaction attached.
     #[must_use]
     pub const fn empty() -> Self {
         Self {

@@ -3472,5 +3472,269 @@ mod tests {
             let final_free: u32 = groups.iter().map(|g| g.free_blocks).sum();
             prop_assert_eq!(final_free, initial_free, "all blocks should be recovered");
         }
+
+        /// Invariant: mapping a sub-range of an allocated extent returns correct physical offsets.
+        ///
+        /// After allocating [0, count), mapping [start, start+len) within that range
+        /// should produce physical addresses offset from the original allocation base.
+        #[test]
+        fn proptest_map_subrange_correct_physical_offsets(
+            count in 2_u32..60,
+            sub_start_frac in 0_u32..100,
+            sub_len_frac in 1_u32..100,
+        ) {
+            let sub_start = sub_start_frac % count;
+            let max_len = count - sub_start;
+            let sub_len = 1 + (sub_len_frac % max_len);
+
+            let cx = test_cx();
+            let dev = MemBlockDevice::new(4096);
+            let geo = make_geometry();
+            let mut groups = make_groups(&geo);
+            let mut root = empty_root();
+            let pctx = mock_pctx();
+
+            let alloc = allocate_extent(
+                &cx, &dev, &mut root, &geo, &mut groups,
+                0, count,
+                &AllocHint::default(), &pctx,
+            ).unwrap();
+
+            // Map sub-range and check physical addresses.
+            let maps = map_logical_to_physical(&cx, &dev, &root, sub_start, sub_len).unwrap();
+            let total: u32 = maps.iter().map(|m| m.count).sum();
+            prop_assert_eq!(total, sub_len, "sub-range should cover requested count");
+
+            for m in &maps {
+                if m.physical_start != 0 {
+                    let expected = alloc.physical_start + u64::from(m.logical_start);
+                    prop_assert_eq!(
+                        m.physical_start, expected,
+                        "physical offset at logical {} should be base + offset",
+                        m.logical_start,
+                    );
+                }
+            }
+        }
+
+        /// Invariant: truncate at a partial offset frees only the tail.
+        ///
+        /// After allocating [0, count), truncating at `cut` should free
+        /// exactly `count - cut` blocks and leave [0, cut) intact.
+        #[test]
+        fn proptest_truncate_partial_preserves_head(
+            count in 2_u32..60,
+            cut_frac in 1_u32..100,
+        ) {
+            let cut = 1 + (cut_frac % (count - 1)); // 1..count-1 inclusive
+            let cx = test_cx();
+            let dev = MemBlockDevice::new(4096);
+            let geo = make_geometry();
+            let mut groups = make_groups(&geo);
+            let mut root = empty_root();
+            let pctx = mock_pctx();
+
+            let alloc = allocate_extent(
+                &cx, &dev, &mut root, &geo, &mut groups,
+                0, count,
+                &AllocHint::default(), &pctx,
+            ).unwrap();
+
+            let freed = truncate_extents(
+                &cx, &dev, &mut root, &geo, &mut groups, cut, &pctx,
+            ).unwrap();
+            prop_assert_eq!(freed, u64::from(count - cut), "freed block count");
+
+            // Head should still map correctly.
+            let maps = map_logical_to_physical(&cx, &dev, &root, 0, cut).unwrap();
+            let mapped: u32 = maps.iter().filter(|m| m.physical_start != 0).map(|m| m.count).sum();
+            prop_assert_eq!(mapped, cut, "head blocks should survive truncation");
+            prop_assert_eq!(maps[0].physical_start, alloc.physical_start);
+
+            // Tail should be holes.
+            let tail = map_logical_to_physical(&cx, &dev, &root, cut, 1).unwrap();
+            prop_assert_eq!(tail[0].physical_start, 0, "truncated block should be hole");
+        }
+
+        /// Invariant: mark_written is idempotent on already-written extents.
+        ///
+        /// Marking the same range written twice should produce identical mappings.
+        #[test]
+        fn proptest_mark_written_idempotent(
+            count in 1_u32..30,
+            mark_offset in 0_u32..30,
+            mark_len in 1_u32..30,
+        ) {
+            prop_assume!(mark_offset < count);
+            let actual_mark = mark_len.min(count - mark_offset);
+
+            let cx = test_cx();
+            let dev = MemBlockDevice::new(4096);
+            let geo = make_geometry();
+            let mut groups = make_groups(&geo);
+            let mut root = empty_root();
+            let pctx = mock_pctx();
+
+            allocate_unwritten_extent(
+                &cx, &dev, &mut root, &geo, &mut groups,
+                0, count,
+                &AllocHint::default(), &pctx,
+            ).unwrap();
+
+            // First mark_written.
+            mark_written(
+                &cx, &dev, &mut root, &geo, &mut groups,
+                mark_offset, actual_mark, &pctx,
+            ).unwrap();
+            let maps1 = map_logical_to_physical(&cx, &dev, &root, 0, count).unwrap();
+
+            // Second mark_written on the same range.
+            mark_written(
+                &cx, &dev, &mut root, &geo, &mut groups,
+                mark_offset, actual_mark, &pctx,
+            ).unwrap();
+            let maps2 = map_logical_to_physical(&cx, &dev, &root, 0, count).unwrap();
+
+            prop_assert_eq!(maps1.len(), maps2.len(), "idempotent: same number of mappings");
+            for (a, b) in maps1.iter().zip(maps2.iter()) {
+                prop_assert_eq!(a, b, "idempotent: mapping should be identical");
+            }
+        }
+
+        /// Invariant: two disjoint allocations have non-overlapping physical ranges.
+        ///
+        /// Allocating at two non-overlapping logical ranges should yield
+        /// physical ranges that do not intersect.
+        #[test]
+        fn proptest_disjoint_allocs_non_overlapping_physical(
+            count_a in 1_u32..30,
+            gap in 0_u32..20,
+            count_b in 1_u32..30,
+        ) {
+            let cx = test_cx();
+            let dev = MemBlockDevice::new(4096);
+            let geo = make_geometry();
+            let mut groups = make_groups(&geo);
+            let mut root = empty_root();
+            let pctx = mock_pctx();
+
+            let a = allocate_extent(
+                &cx, &dev, &mut root, &geo, &mut groups,
+                0, count_a,
+                &AllocHint::default(), &pctx,
+            ).unwrap();
+
+            let b_offset = count_a + gap;
+            let b = allocate_extent(
+                &cx, &dev, &mut root, &geo, &mut groups,
+                b_offset, count_b,
+                &AllocHint::default(), &pctx,
+            ).unwrap();
+
+            let a_end = a.physical_start + u64::from(count_a);
+            let b_end = b.physical_start + u64::from(count_b);
+
+            // Physical ranges must not overlap.
+            prop_assert!(
+                a_end <= b.physical_start || b_end <= a.physical_start,
+                "physical ranges [{}, {}) and [{}, {}) overlap",
+                a.physical_start, a_end, b.physical_start, b_end,
+            );
+        }
+
+        /// Invariant: punch_hole creates a proper hole visible via map.
+        ///
+        /// After allocating [0, count), punching [hole_offset, hole_end) should
+        /// make those blocks appear as holes (physical_start == 0) while the
+        /// surviving prefix remains correctly mapped.
+        #[test]
+        fn proptest_punch_creates_visible_hole(
+            count in 4_u32..40,
+            hole_offset in 1_u32..39,
+            hole_len in 1_u32..10,
+        ) {
+            prop_assume!(hole_offset < count);
+            let actual_hole = hole_len.min(count - hole_offset);
+            prop_assume!(actual_hole > 0);
+
+            let cx = test_cx();
+            let dev = MemBlockDevice::new(4096);
+            let geo = make_geometry();
+            let mut groups = make_groups(&geo);
+            let mut root = empty_root();
+            let pctx = mock_pctx();
+
+            let orig = allocate_extent(
+                &cx, &dev, &mut root, &geo, &mut groups,
+                0, count,
+                &AllocHint::default(), &pctx,
+            ).unwrap();
+
+            punch_hole(
+                &cx, &dev, &mut root, &geo, &mut groups,
+                hole_offset, actual_hole, &pctx,
+            ).unwrap();
+
+            // Map the full range.
+            let maps = map_logical_to_physical(&cx, &dev, &root, 0, count).unwrap();
+
+            // Prefix [0, hole_offset) should still be physically mapped.
+            let prefix_mapped: u32 = maps.iter()
+                .filter(|m| m.logical_start < hole_offset && m.physical_start != 0)
+                .map(|m| {
+                    let m_end = m.logical_start + m.count;
+                    let effective_end = m_end.min(hole_offset);
+                    effective_end - m.logical_start
+                })
+                .sum();
+            prop_assert_eq!(prefix_mapped, hole_offset, "prefix should survive punch");
+            prop_assert_eq!(maps[0].physical_start, orig.physical_start, "prefix physical unchanged");
+
+            // Hole region should have physical_start == 0.
+            let hole_end = hole_offset + actual_hole;
+            for m in &maps {
+                let m_end = m.logical_start + m.count;
+                // If this mapping is entirely within the hole range:
+                if m.logical_start >= hole_offset && m_end <= hole_end {
+                    prop_assert_eq!(
+                        m.physical_start, 0,
+                        "block [{}, {}) in hole should have physical=0",
+                        m.logical_start, m_end,
+                    );
+                }
+            }
+        }
+
+        /// Invariant: split produces at most 3 extents for any overlap pattern.
+        ///
+        /// The `split_for_mark_written` function should produce exactly 1, 2, or 3
+        /// extents depending on the overlap pattern. Never 0 or more than 3.
+        #[test]
+        fn proptest_split_produces_1_to_3_extents(
+            logical_block in 0_u32..500,
+            actual_len in 1_u16..100,
+            physical_start in 1_u64..100_000,
+            mark_offset in 0_u32..200,
+            mark_len in 1_u32..200,
+        ) {
+            let ext_end = logical_block.saturating_add(u32::from(actual_len));
+            let mark_start = logical_block.saturating_add(mark_offset % u32::from(actual_len));
+            let mark_end = mark_start.saturating_add(mark_len).min(ext_end + 50);
+            let mark_count = mark_end.saturating_sub(mark_start);
+            prop_assume!(mark_start < ext_end && mark_end > logical_block && mark_count > 0);
+
+            let ext = Ext4Extent {
+                logical_block,
+                raw_len: actual_len | UNWRITTEN_FLAG,
+                physical_start,
+            };
+
+            let parts = split_for_mark_written(&ext, mark_start, mark_end, ext_end, mark_count);
+            prop_assert!(
+                (1..=3).contains(&parts.len()),
+                "split produced {} extents (expected 1-3)",
+                parts.len(),
+            );
+        }
     }
 }

@@ -3700,10 +3700,7 @@ fn validate_ext4_group_descriptors(
     }
 }
 
-pub fn ext4_group_scrub_scope(
-    sb: &Ext4Superblock,
-    group: u32,
-) -> Result<(BlockNumber, u64)> {
+pub fn ext4_group_scrub_scope(sb: &Ext4Superblock, group: u32) -> Result<(BlockNumber, u64)> {
     let groups = sb.groups_count();
     if group >= groups {
         bail!("block group {group} out of range (groups_count={groups})");
