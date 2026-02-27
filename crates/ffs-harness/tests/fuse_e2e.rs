@@ -643,8 +643,7 @@ fn fuse_setattr_chmod() {
         );
 
         // Change to 0o600.
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-            .expect("chmod 600 via FUSE");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod 600 via FUSE");
 
         let meta = fs::metadata(&path).expect("stat after second chmod");
         assert_eq!(
