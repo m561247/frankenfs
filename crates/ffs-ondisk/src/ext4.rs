@@ -648,8 +648,11 @@ impl Ext4Superblock {
     }
 
     /// Number of block groups in this filesystem.
+    ///
+    /// ext4 block groups are addressed by `u32`; an overflow here indicates a
+    /// corrupted superblock.  We cap at `u32::MAX` instead of silently
+    /// truncating.
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)] // ext4 group count is u32
     pub fn groups_count(&self) -> u32 {
         if self.blocks_per_group == 0 {
             return 0;
@@ -658,7 +661,7 @@ impl Ext4Superblock {
             .blocks_count
             .saturating_sub(u64::from(self.first_data_block));
         let groups = data_blocks.div_ceil(u64::from(self.blocks_per_group));
-        groups as u32
+        u32::try_from(groups).unwrap_or(u32::MAX)
     }
 
     /// Whether this superblock uses metadata checksums (crc32c).

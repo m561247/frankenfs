@@ -3626,10 +3626,8 @@ impl OpenFs {
 
         // Allocate a new inode.
         let parent_group = GroupNumber(
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                (parent.0.saturating_sub(1) / u64::from(geo.inodes_per_group)) as u32
-            },
+            u32::try_from(parent.0.saturating_sub(1) / u64::from(geo.inodes_per_group))
+                .map_err(|_| FfsError::Format("parent inode group index exceeds u32".into()))?,
         );
         let (ino, new_inode) = ffs_inode::create_inode(
             cx,
@@ -3709,10 +3707,8 @@ impl OpenFs {
         let mut alloc = alloc_mutex.lock();
 
         let parent_group = GroupNumber(
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                (parent.0.saturating_sub(1) / u64::from(alloc.geo.inodes_per_group)) as u32
-            },
+            u32::try_from(parent.0.saturating_sub(1) / u64::from(alloc.geo.inodes_per_group))
+                .map_err(|_| FfsError::Format("parent inode group index exceeds u32".into()))?,
         );
         let (ino, mut new_inode) = {
             let Ext4AllocState {
@@ -3750,10 +3746,14 @@ impl OpenFs {
             ffs_alloc::alloc_blocks_persist(cx, &block_dev, geo, groups, 1, &hint, persist_ctx)?
         };
 
-        let block_size_usize = alloc.geo.block_size as usize;
+        let block_size_usize = usize::try_from(alloc.geo.block_size)
+            .map_err(|_| FfsError::Format("block size does not fit usize".into()))?;
         let mut dir_block = vec![0u8; block_size_usize];
-        #[allow(clippy::cast_possible_truncation)]
-        ffs_dir::init_dir_block(&mut dir_block, ino.0 as u32, parent.0 as u32)?;
+        let ino_u32 = u32::try_from(ino.0)
+            .map_err(|_| FfsError::Format("inode number exceeds ext4 32-bit limit".into()))?;
+        let parent_u32 = u32::try_from(parent.0)
+            .map_err(|_| FfsError::Format("inode number exceeds ext4 32-bit limit".into()))?;
+        ffs_dir::init_dir_block(&mut dir_block, ino_u32, parent_u32)?;
         block_dev.write_block(cx, dir_alloc.start, &dir_block)?;
 
         // Set up the extent tree to point to this block.
@@ -3861,8 +3861,8 @@ impl OpenFs {
         let extents = self.collect_extents(cx, parent_inode)?;
 
         // Try adding to each existing block.
-        #[allow(clippy::cast_possible_truncation)]
-        let child_ino_u32 = child_ino.0 as u32;
+        let child_ino_u32 = u32::try_from(child_ino.0)
+            .map_err(|_| FfsError::Format("inode number exceeds ext4 32-bit limit".into()))?;
         for ext in &extents {
             for block in Self::extent_phys_blocks(ext) {
                 let mut data = self.read_block_vec(cx, block)?;
@@ -3901,14 +3901,16 @@ impl OpenFs {
             &alloc.persist_ctx,
         )?;
 
-        let block_size = alloc.geo.block_size as usize;
+        let block_size = usize::try_from(alloc.geo.block_size)
+            .map_err(|_| FfsError::Format("block size does not fit usize".into()))?;
         let mut new_block = vec![0u8; block_size];
         // Write a single empty dir entry spanning the whole block, then add our entry.
         // Initialize with a single unused entry spanning the whole block.
         {
             // rec_len covers the whole block
-            #[allow(clippy::cast_possible_truncation)]
-            let rec_len = block_size as u16;
+            let rec_len = u16::try_from(block_size).map_err(|_| {
+                FfsError::Format("directory block size exceeds 16-bit rec_len field".into())
+            })?;
             new_block[4..6].copy_from_slice(&rec_len.to_le_bytes());
             // inode=0, name_len=0, file_type=0 ⇒ unused entry
         }
@@ -4206,10 +4208,8 @@ impl OpenFs {
         let (ino, mut symlink_inode) = {
             let mut alloc = alloc_mutex.lock();
             let parent_group = GroupNumber(
-                #[allow(clippy::cast_possible_truncation)]
-                {
-                    (parent.0.saturating_sub(1) / u64::from(alloc.geo.inodes_per_group)) as u32
-                },
+                u32::try_from(parent.0.saturating_sub(1) / u64::from(alloc.geo.inodes_per_group))
+                    .map_err(|_| FfsError::Format("parent inode group index exceeds u32".into()))?,
             );
             let (ino, mut inode) = {
                 let Ext4AllocState {
@@ -4300,6 +4300,7 @@ impl OpenFs {
         const KEEP_SIZE: i32 = 0x01;
         const PUNCH_HOLE: i32 = 0x02;
         const EINVAL_ERRNO: i32 = 22;
+        #[allow(clippy::cast_possible_truncation)] // 32767 always fits u32
         const MAX_EXTENT_COUNT: u32 = (u16::MAX >> 1) as u32;
 
         let alloc_mutex = self.require_alloc_state()?;
@@ -4501,7 +4502,6 @@ impl OpenFs {
     #[allow(
         clippy::too_many_lines,
         clippy::significant_drop_tightening,
-        clippy::cast_possible_truncation,
         clippy::single_match_else
     )]
     fn ext4_write(
@@ -4534,13 +4534,23 @@ impl OpenFs {
         let mut alloc = alloc_mutex.lock();
         let mut bytes_written = 0u32;
         let mut pos = offset;
-        let end = offset + data.len() as u64;
+        let write_len = u64::try_from(data.len())
+            .map_err(|_| FfsError::Format("write length does not fit u64".into()))?;
+        let end = offset
+            .checked_add(write_len)
+            .ok_or_else(|| FfsError::Format("write range overflow".into()))?;
 
         while pos < end {
-            #[allow(clippy::cast_possible_truncation)]
-            let logical_block = (pos / bs) as u32;
-            let block_offset = (pos % bs) as usize;
-            let chunk_len = ((bs as usize) - block_offset).min((end - pos) as usize);
+            let logical_block = u32::try_from(pos / bs).map_err(|_| {
+                FfsError::Format("file offset exceeds ext4 32-bit logical block limit".into())
+            })?;
+            let block_offset = usize::try_from(pos % bs)
+                .map_err(|_| FfsError::Format("block offset does not fit usize".into()))?;
+            let bs_usize = usize::try_from(bs)
+                .map_err(|_| FfsError::Format("block size does not fit usize".into()))?;
+            let remaining = usize::try_from(end - pos)
+                .map_err(|_| FfsError::Format("remaining write size does not fit usize".into()))?;
+            let chunk_len = (bs_usize - block_offset).min(remaining);
 
             // Resolve or allocate the physical block.
             let extents = self.collect_extents(cx, &inode)?;
@@ -4594,22 +4604,24 @@ impl OpenFs {
             };
 
             // Read-modify-write the block.
-            let mut block_data = if block_offset == 0 && chunk_len == bs as usize {
-                vec![0u8; bs as usize]
+            let mut block_data = if block_offset == 0 && chunk_len == bs_usize {
+                vec![0u8; bs_usize]
             } else {
                 let buf = block_dev.read_block(cx, phys_block)?;
                 buf.as_slice().to_vec()
             };
-            let data_start = (pos - offset) as usize;
+            let data_start = usize::try_from(pos - offset)
+                .map_err(|_| FfsError::Format("write offset does not fit usize".into()))?;
             block_data[block_offset..block_offset + chunk_len]
                 .copy_from_slice(&data[data_start..data_start + chunk_len]);
             block_dev.write_block(cx, phys_block, &block_data)?;
 
-            pos += chunk_len as u64;
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                bytes_written += chunk_len as u32;
-            }
+            let chunk_u64 = u64::try_from(chunk_len)
+                .map_err(|_| FfsError::Format("chunk length does not fit u64".into()))?;
+            pos = pos.saturating_add(chunk_u64);
+            let chunk_u32 = u32::try_from(chunk_len)
+                .map_err(|_| FfsError::Format("chunk length does not fit u32".into()))?;
+            bytes_written = bytes_written.saturating_add(chunk_u32);
         }
 
         // Update inode size if we extended the file.
@@ -4813,8 +4825,10 @@ impl OpenFs {
                 if let Err(e) = ffs_dir::remove_entry(&mut data, b"..") {
                     warn!("rename: failed to remove '..' entry: {e}");
                 }
-                #[allow(clippy::cast_possible_truncation)]
-                ffs_dir::add_entry(&mut data, new_parent.0 as u32, b"..", Ext4FileType::Dir)?;
+                let parent_ino_u32 = u32::try_from(new_parent.0).map_err(|_| {
+                    FfsError::Format("inode number exceeds ext4 32-bit limit".into())
+                })?;
+                ffs_dir::add_entry(&mut data, parent_ino_u32, b"..", Ext4FileType::Dir)?;
                 block_dev.write_block(cx, dot_dot_block, &data)?;
             }
 
@@ -4920,8 +4934,12 @@ impl OpenFs {
 
                 if new_size < inode.size {
                     // Truncate: free blocks beyond new size.
-                    #[allow(clippy::cast_possible_truncation)]
-                    let new_logical_end = new_size.div_ceil(u64::from(block_size)) as u32;
+                    let new_logical_end = u32::try_from(new_size.div_ceil(u64::from(block_size)))
+                        .map_err(|_| {
+                        FfsError::Format(
+                            "truncation size exceeds ext4 32-bit logical block limit".into(),
+                        )
+                    })?;
                     let mut root_bytes = Self::extent_root(&inode);
                     let freed = {
                         let Ext4AllocState {
@@ -5066,7 +5084,9 @@ impl OpenFs {
                 let block_size = geo.block_size;
                 drop(alloc);
 
-                external_block = Some(vec![0u8; block_size as usize]);
+                let block_size_usize = usize::try_from(block_size)
+                    .map_err(|_| FfsError::Format("block size does not fit usize".to_owned()))?;
+                external_block = Some(vec![0u8; block_size_usize]);
                 inode.file_acl = block_alloc.start.0;
                 if inode.is_huge_file() {
                     inode.blocks = inode.blocks.saturating_add(1);
@@ -5312,7 +5332,7 @@ impl OpenFs {
     // ── Btrfs write path ─────────────────────────────────────────────────
 
     /// Write file data on a btrfs filesystem.
-    #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
+    #[allow(clippy::too_many_lines)]
     fn btrfs_write(
         &self,
         cx: &Cx,
@@ -5350,8 +5370,10 @@ impl OpenFs {
             return Err(FfsError::IsDirectory);
         }
 
+        let data_len_u64 = u64::try_from(data.len())
+            .map_err(|_| FfsError::InvalidGeometry("write length does not fit u64".into()))?;
         let end = offset
-            .checked_add(data.len() as u64)
+            .checked_add(data_len_u64)
             .ok_or_else(|| FfsError::InvalidGeometry("offset + length overflow".into()))?;
         let sectorsize = u64::from(alloc.nodesize.min(4096));
 
@@ -5396,7 +5418,10 @@ impl OpenFs {
                 compression: 0,
                 data: {
                     // Build the full file content up to `end`.
-                    let mut content = vec![0u8; end as usize];
+                    let end_usize = usize::try_from(end).map_err(|_| {
+                        FfsError::InvalidGeometry("end offset does not fit usize".into())
+                    })?;
+                    let mut content = vec![0u8; end_usize];
                     // Read any existing inline data.
                     let existing_key = BtrfsKey {
                         objectid: canonical,
@@ -5413,7 +5438,10 @@ impl OpenFs {
                             }
                         }
                     }
-                    content[offset as usize..end as usize].copy_from_slice(data);
+                    let offset_usize = usize::try_from(offset).map_err(|_| {
+                        FfsError::InvalidGeometry("offset does not fit usize".into())
+                    })?;
+                    content[offset_usize..end_usize].copy_from_slice(data);
                     content
                 },
             };
@@ -5459,9 +5487,13 @@ impl OpenFs {
                         } else if !prev_data.is_empty() && offset > 0 {
                             // Persist the old inline data as a regular extent at
                             // offset 0 so reads in [0, prev_data.len()) still work.
-                            let prev_alloc_size = (prev_data.len() as u64)
-                                .saturating_add(sectorsize - 1)
-                                & !(sectorsize - 1);
+                            let prev_data_len = u64::try_from(prev_data.len()).map_err(|_| {
+                                FfsError::InvalidGeometry(
+                                    "existing inline extent length does not fit u64".into(),
+                                )
+                            })?;
+                            let prev_alloc_size =
+                                prev_data_len.saturating_add(sectorsize - 1) & !(sectorsize - 1);
                             let prev_allocation = alloc
                                 .extent_alloc
                                 .alloc_data(prev_alloc_size)
@@ -5478,7 +5510,7 @@ impl OpenFs {
                                 disk_bytenr: prev_allocation.bytenr,
                                 disk_num_bytes: prev_alloc_size,
                                 extent_offset: 0,
-                                num_bytes: prev_data.len() as u64,
+                                num_bytes: prev_data_len,
                             };
                             alloc
                                 .fs_tree
@@ -5493,7 +5525,9 @@ impl OpenFs {
             let write_len = data_to_write.len();
 
             // Allocate a data extent and write through the device.
-            let alloc_size = (write_len as u64).saturating_add(sectorsize - 1) & !(sectorsize - 1);
+            let write_len_u64 = u64::try_from(write_len)
+                .map_err(|_| FfsError::InvalidGeometry("write length does not fit u64".into()))?;
+            let alloc_size = write_len_u64.saturating_add(sectorsize - 1) & !(sectorsize - 1);
             let allocation = alloc
                 .extent_alloc
                 .alloc_data(alloc_size)
@@ -5514,7 +5548,7 @@ impl OpenFs {
                 disk_bytenr,
                 disk_num_bytes: alloc_size,
                 extent_offset: 0,
-                num_bytes: write_len as u64,
+                num_bytes: write_len_u64,
             };
             let extent_key = BtrfsKey {
                 objectid: canonical,
@@ -5581,7 +5615,9 @@ impl OpenFs {
             "btrfs data written"
         );
 
-        Ok(data.len() as u32)
+        let written = u32::try_from(data.len())
+            .map_err(|_| FfsError::InvalidGeometry("write length exceeds u32".into()))?;
+        Ok(written)
     }
 
     /// Create a regular file in a btrfs directory.
@@ -5905,9 +5941,13 @@ impl OpenFs {
         let new_oid = alloc.next_objectid;
         alloc.next_objectid = alloc.next_objectid.saturating_add(1);
 
+        let target_len = u64::try_from(target_bytes.len()).map_err(|_| {
+            FfsError::InvalidGeometry("symlink target length does not fit u64".into())
+        })?;
+
         let inode = BtrfsInodeItem {
-            size: target_bytes.len() as u64,
-            nbytes: target_bytes.len() as u64,
+            size: target_len,
+            nbytes: target_len,
             nlink: 1,
             uid,
             gid,
@@ -6147,9 +6187,13 @@ impl OpenFs {
                             .map_err(|e| btrfs_mutation_to_ffs(&e))?;
                         let sectorsize = u64::from(alloc.nodesize.min(4096));
                         if !prev_data.is_empty() {
-                            let prev_alloc_size = (prev_data.len() as u64)
-                                .saturating_add(sectorsize - 1)
-                                & !(sectorsize - 1);
+                            let prev_data_len = u64::try_from(prev_data.len()).map_err(|_| {
+                                FfsError::InvalidGeometry(
+                                    "existing inline extent length does not fit u64".into(),
+                                )
+                            })?;
+                            let prev_alloc_size =
+                                prev_data_len.saturating_add(sectorsize - 1) & !(sectorsize - 1);
                             let prev_allocation = alloc
                                 .extent_alloc
                                 .alloc_data(prev_alloc_size)
@@ -6166,7 +6210,7 @@ impl OpenFs {
                                 disk_bytenr: prev_allocation.bytenr,
                                 disk_num_bytes: prev_alloc_size,
                                 extent_offset: 0,
-                                num_bytes: prev_data.len() as u64,
+                                num_bytes: prev_data_len,
                             };
                             alloc
                                 .fs_tree
@@ -6363,11 +6407,12 @@ impl OpenFs {
         payload.extend_from_slice(&[0u8; 17]);
         // transid: zeros
         payload.extend_from_slice(&[0u8; 8]);
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            payload.extend_from_slice(&(value.len() as u16).to_le_bytes());
-            payload.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        }
+        let value_len = u16::try_from(value.len()).map_err(|_| {
+            FfsError::InvalidGeometry("xattr value length exceeds 16-bit field".into())
+        })?;
+        let name_len = u16::try_from(name.len()).map_err(|_| FfsError::NameTooLong)?;
+        payload.extend_from_slice(&value_len.to_le_bytes());
+        payload.extend_from_slice(&name_len.to_le_bytes());
         payload.push(0); // type = 0 for xattr
         payload.extend_from_slice(name.as_bytes());
         payload.extend_from_slice(value);

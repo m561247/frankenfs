@@ -294,11 +294,14 @@ impl FsGeometry {
 
     /// Convert absolute block to (group, relative_block).
     #[must_use]
-    #[expect(clippy::cast_possible_truncation)]
     pub fn absolute_to_group_block(&self, block: BlockNumber) -> (GroupNumber, u32) {
         let rel = block.0.saturating_sub(u64::from(self.first_data_block));
-        let group = (rel / u64::from(self.blocks_per_group)) as u32;
-        let offset = (rel % u64::from(self.blocks_per_group)) as u32;
+        let bpg = u64::from(self.blocks_per_group);
+        // Group number: ext4 uses u32 group addressing; cap on overflow.
+        let group = u32::try_from(rel / bpg).unwrap_or(u32::MAX);
+        // Offset is always < blocks_per_group (u32), so the cast is safe.
+        #[allow(clippy::cast_possible_truncation)]
+        let offset = (rel % bpg) as u32;
         (GroupNumber(group), offset)
     }
 }
