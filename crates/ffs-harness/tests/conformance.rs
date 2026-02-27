@@ -3,6 +3,7 @@
 use asupersync::Cx;
 use ffs_core::{OpenFs, OpenOptions};
 use ffs_harness::{
+    e2e::{CrashReplaySuiteConfig, FsxStressConfig, run_crash_replay_suite, run_fsx_stress},
     GoldenReference, ParityReport, validate_btrfs_chunk_fixture, validate_btrfs_fixture,
     validate_btrfs_leaf_fixture, validate_dir_block_fixture, validate_ext4_fixture,
     validate_group_desc_fixture, validate_inode_fixture,
@@ -489,4 +490,37 @@ fn assert_parity_report_100_percent() {
     assert_eq!(report.overall_implemented, report2.overall_implemented);
     assert_eq!(report.overall_total, report2.overall_total);
     assert_eq!(report.domains.len(), report2.domains.len());
+}
+
+#[test]
+#[ignore = "stress integration; run explicitly with --ignored"]
+fn crash_replay_suite_short_integration() {
+    let config = CrashReplaySuiteConfig {
+        schedule_count: 20,
+        min_operations: 100,
+        max_operations: 1000,
+        base_seed: 0xFF5E_ED00_0000_0001,
+        output_dir: None,
+    };
+    let report = run_crash_replay_suite(&config).expect("run crash replay suite");
+    assert_eq!(report.schedule_count, config.schedule_count);
+    assert_eq!(report.failed_schedules, 0);
+    assert_eq!(report.passed_schedules, config.schedule_count);
+}
+
+#[test]
+#[ignore = "stress integration; run explicitly with --ignored"]
+fn fsx_stress_short_integration() {
+    let config = FsxStressConfig {
+        operation_count: 500,
+        seed: 0xF5A5_7E55_0000_0001,
+        max_file_size_bytes: 8 * 1024 * 1024,
+        corruption_every_ops: 100,
+        full_verify_every_ops: 100,
+        output_dir: None,
+    };
+    let report = run_fsx_stress(&config).expect("run fsx stress");
+    assert!(report.passed, "failure: {:#?}", report.failure);
+    assert_eq!(report.operations_executed, config.operation_count);
+    assert!(report.failure.is_none());
 }

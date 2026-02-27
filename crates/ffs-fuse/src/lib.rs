@@ -1872,24 +1872,10 @@ impl MountHandle {
     #[must_use]
     pub fn wait(mut self) -> MetricsSnapshot {
         info!(mountpoint = %self.mountpoint.display(), "waiting for shutdown signal");
-        let started = Instant::now();
-        let timeout = self.config.unmount_timeout;
         while !self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            let elapsed = started.elapsed();
-            if elapsed >= timeout {
-                warn!(
-                    mountpoint = %self.mountpoint.display(),
-                    timeout_ms = timeout.as_millis(),
-                    "shutdown wait timed out; forcing unmount"
-                );
-                break;
-            }
-            let remaining = timeout.saturating_sub(elapsed);
-            std::thread::sleep(std::cmp::min(Duration::from_millis(100), remaining));
+            std::thread::sleep(Duration::from_millis(100));
         }
-        if self.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-            info!(mountpoint = %self.mountpoint.display(), "shutdown signal received");
-        }
+        info!(mountpoint = %self.mountpoint.display(), "shutdown signal received");
         self.do_unmount()
     }
 

@@ -235,9 +235,10 @@ impl FsGeometry {
     /// Derive geometry from a parsed superblock.
     #[must_use]
     pub fn from_superblock(sb: &Ext4Superblock) -> Self {
-        let group_count = if sb.blocks_per_group > 0 {
-            let full = sb.blocks_count / u64::from(sb.blocks_per_group);
-            let remainder = sb.blocks_count % u64::from(sb.blocks_per_group);
+        let group_count = if sb.blocks_per_group > 0 && sb.blocks_count >= u64::from(sb.first_data_block) {
+            let data_blocks = sb.blocks_count - u64::from(sb.first_data_block);
+            let full = data_blocks / u64::from(sb.blocks_per_group);
+            let remainder = data_blocks % u64::from(sb.blocks_per_group);
             let count = full + u64::from(remainder > 0);
             // Saturate at u32::MAX; geometry validation catches oversized values.
             u32::try_from(count).unwrap_or(u32::MAX)
