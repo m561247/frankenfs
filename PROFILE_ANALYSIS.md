@@ -16,19 +16,22 @@
 
 Target bead: `bd-3ib.1` ("Profile read path and generate flamegraph").
 
-Attempted canonical target command:
+Canonical target command:
 
 ```bash
 ffs inspect conformance/golden/ext4_8mb_reference.ext4 --json
 ```
 
-Current parser behavior blocks this image:
+**Status (2026-02-27):** Non-contiguous ext4 journal extents are now fully supported.
+The golden fixture (`ext4_8mb_reference.ext4`) has 3 journal segments and inspects
+successfully in ~3.7 ms, producing:
 
-```text
-unsupported feature: non-contiguous ext4 journal extents are not supported
+```json
+{"filesystem":"ext4","block_size":4096,"inodes_count":2048,"blocks_count":2048,"volume_name":"ffs-ref","free_blocks_total":851,"free_inodes_total":2033}
 ```
 
-Workaround used to complete profiling run:
+The original profiling run (2026-02-13) predated the multi-segment journal support
+and used a workaround no-journal image instead:
 
 ```bash
 cargo flamegraph --root -p ffs-cli --output profiles/flamegraph_cli_inspect.svg -- \
@@ -61,28 +64,29 @@ Top symbols:
 
 From `baselines/baseline-20260213.md`:
 
-- `ffs-cli inspect ext4_8mb_reference.ext4 --json` is currently skipped for the same unsupported ext4 journal-extent feature.
-- Available baseline numbers are for parity/check-fixtures commands only (`~0.9–1.2 ms` range).
+- `ffs-cli inspect ext4_8mb_reference.ext4 --json` was skipped at baseline time due to the (now-resolved) non-contiguous journal extent limitation.
+- Available baseline numbers were for parity/check-fixtures commands only (`~0.9–1.2 ms` range).
 
-Consequence: inspect-path regression tracking is not yet available on canonical conformance fixtures.
+**Update (2026-02-27):** The inspect path now works on the canonical fixture. Inspect-path regression tracking can be added to future baselines.
 
 ## Opportunity Matrix
 
-| Candidate | Impact | Confidence | Effort | Score (I*C/E) | Evidence |
+| Candidate | Impact | Confidence | Effort | Score (I*C/E) | Status |
 |---|---|---|---|---:|---|
-| Implement ext4 non-contiguous journal extent support in inspect open path | High | High | Medium | 3.0 | Canonical inspect is blocked in both baseline + profiling runs |
-| Add a repeatable inspect profiling harness (looped workload) to raise sample count and expose Rust hot code | Medium | High | Low | 4.0 | Current profile has only 18 samples, dominated by loader/startup |
-| Add FUSE read-path flamegraph once inspect fixture path is unblocked | Medium | Medium | Medium | 1.0 | Bead recommends FUSE profile; currently blocked by image support path |
-| Optimize CLI cold-start overhead (link/load + startup path) after longer-run profile confirms bottleneck | Low-Medium | Low | Medium | 0.5 | Existing data is low-confidence and startup-heavy |
+| ~~Implement ext4 non-contiguous journal extent support~~ | ~~High~~ | ~~High~~ | ~~Medium~~ | ~~3.0~~ | **DONE** — multi-segment journal replay implemented |
+| Add a repeatable inspect profiling harness (looped workload) to raise sample count and expose Rust hot code | Medium | High | Low | 4.0 | Open — current profile has only 18 samples, dominated by loader/startup |
+| Add FUSE read-path flamegraph (inspect fixture path now unblocked) | Medium | Medium | Medium | 1.0 | Open — no longer blocked by journal extent support |
+| Optimize CLI cold-start overhead (link/load + startup path) after longer-run profile confirms bottleneck | Low-Medium | Low | Medium | 0.5 | Open — low-confidence, needs profiling harness first |
 
-## Recommended First Targets
+## Recommended Next Targets
 
-1. Unblock canonical inspect path by implementing support for non-contiguous ext4 journal extents.
+1. ~~Unblock canonical inspect path by implementing support for non-contiguous ext4 journal extents.~~ **DONE.**
 2. Add a deterministic profiling harness that runs inspect repeatedly in one invocation window (to collect meaningful Rust-symbol samples).
 3. Re-run flamegraph against canonical fixture and update this document with post-fix hotspot data.
+4. Add FUSE read-path flamegraph (now unblocked).
 
 ## Limitations
 
-- This run used a temporary no-journal ext4 image (`/tmp/ffs-profile-nojournal.fjnSmr.ext4`) rather than the canonical golden ext4 fixture.
-- The sample count is too low for high-confidence micro-optimization decisions.
+- The original (2026-02-13) run used a temporary no-journal ext4 image rather than the canonical golden ext4 fixture. The journal extent blocker is now resolved.
+- The sample count (18) is too low for high-confidence micro-optimization decisions.
 - A useful application-level hotspot map requires a longer-running inspect workload (or in-process repeated inspection).

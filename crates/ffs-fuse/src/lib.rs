@@ -857,30 +857,51 @@ impl FrankenFuse {
     ) -> ffs_error::Result<Vec<u8>> {
         let requested_len = usize::try_from(size).unwrap_or(usize::MAX);
         self.with_request_scope(cx, RequestOp::Read, |cx| {
-            if let Some(prefetched) = self.inner.readahead.take(ino, byte_offset, requested_len) {
-                trace!(
-                    target: "ffs::fuse::io",
-                    event = "readahead_hit",
-                    ino = ino.0,
-                    offset = byte_offset,
-                    bytes = prefetched.len()
-                );
-                self.inner.access_predictor.record_read(
-                    ino,
-                    byte_offset,
-                    u32::try_from(prefetched.len()).unwrap_or(u32::MAX),
-                );
-                return Ok(prefetched);
-            }
-
-            let fetch_size = self
+            let mut served = self
                 .inner
-                .access_predictor
-                .fetch_size(ino, byte_offset, size);
-            let fetched = self.inner.ops.read(cx, ino, byte_offset, fetch_size)?;
-            let served_len = requested_len.min(fetched.len());
-            let mut served = fetched;
-            let tail = served.split_off(served_len);
+                .readahead
+                .take(ino, byte_offset, requested_len)
+                .map_or_else(Vec::new, |prefetched| {
+                    trace!(
+                        target: "ffs::fuse::io",
+                        event = "readahead_hit",
+                        ino = ino.0,
+                        offset = byte_offset,
+                        bytes = prefetched.len()
+                    );
+                    prefetched
+                });
+
+            if served.len() < requested_len {
+                let remaining_req =
+                    size.saturating_sub(u32::try_from(served.len()).unwrap_or(u32::MAX));
+                let next_offset =
+                    byte_offset.saturating_add(u64::try_from(served.len()).unwrap_or(u64::MAX));
+                let fetch_size =
+                    self.inner
+                        .access_predictor
+                        .fetch_size(ino, next_offset, remaining_req);
+
+                let mut fetched = self.inner.ops.read(cx, ino, next_offset, fetch_size)?;
+                let fetched_served_len = (requested_len - served.len()).min(fetched.len());
+                let tail = fetched.split_off(fetched_served_len);
+
+                served.append(&mut fetched);
+
+                if !tail.is_empty() {
+                    let consumed = u64::try_from(fetched_served_len).unwrap_or(u64::MAX);
+                    let prefetch_offset = next_offset.saturating_add(consumed);
+                    let prefetch_bytes = tail.len();
+                    self.inner.readahead.insert(ino, prefetch_offset, tail);
+                    debug!(
+                        target: "ffs::fuse::io",
+                        event = "readahead_queued",
+                        ino = ino.0,
+                        offset = prefetch_offset,
+                        bytes = prefetch_bytes
+                    );
+                }
+            }
 
             self.inner.access_predictor.record_read(
                 ino,
@@ -888,19 +909,6 @@ impl FrankenFuse {
                 u32::try_from(served.len()).unwrap_or(u32::MAX),
             );
 
-            if !tail.is_empty() {
-                let consumed = u64::try_from(served_len).unwrap_or(u64::MAX);
-                let prefetch_offset = byte_offset.saturating_add(consumed);
-                let prefetch_bytes = tail.len();
-                self.inner.readahead.insert(ino, prefetch_offset, tail);
-                debug!(
-                    target: "ffs::fuse::io",
-                    event = "readahead_queued",
-                    ino = ino.0,
-                    offset = prefetch_offset,
-                    bytes = prefetch_bytes
-                );
-            }
             Ok(served)
         })
     }
