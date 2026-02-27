@@ -2,10 +2,11 @@
 
 use ffs_types as crc32c;
 use ffs_types::{
-    EXT4_EXTENTS_FL, EXT4_FAST_SYMLINK_MAX, EXT4_HUGE_FILE_FL, EXT4_INDEX_FL, EXT4_SUPER_MAGIC,
-    EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE, EXT4_XATTR_MAGIC, GroupNumber, InodeNumber,
-    ParseError, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK,
-    ensure_slice, ext4_block_size_from_log, read_fixed, read_le_u16, read_le_u32, trim_nul_padded,
+    EXT4_EXTENTS_FL, EXT4_FAST_SYMLINK_MAX, EXT4_HUGE_FILE_FL, EXT4_INDEX_FL,
+    EXT4_SB_CHECKSUM_OFFSET, EXT4_SUPER_MAGIC, EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE,
+    EXT4_XATTR_MAGIC, GroupNumber, InodeNumber, ParseError, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO,
+    S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, ensure_slice, ext4_block_size_from_log, read_fixed,
+    read_le_u16, read_le_u32, trim_nul_padded,
 };
 use serde::{Deserialize, Serialize};
 
@@ -594,7 +595,7 @@ impl Ext4Superblock {
             // Checksums
             checksum_type,
             checksum_seed: read_le_u32(region, 0x270)?,
-            checksum: read_le_u32(region, 0x3FC)?,
+            checksum: read_le_u32(region, EXT4_SB_CHECKSUM_OFFSET)?,
         })
     }
 
@@ -689,7 +690,7 @@ impl Ext4Superblock {
 
     /// Validate the superblock's own CRC32C checksum.
     ///
-    /// The kernel computes: `ext4_chksum(sbi, ~0, sb_bytes[..0x3FC])`.
+    /// The kernel computes: `ext4_chksum(sbi, ~0, sb_bytes[..EXT4_SB_CHECKSUM_OFFSET])`.
     pub fn validate_checksum(&self, raw_region: &[u8]) -> Result<(), ParseError> {
         if !self.has_metadata_csum() {
             return Ok(());
@@ -702,7 +703,7 @@ impl Ext4Superblock {
             });
         }
         // kernel: ext4_chksum(sbi, ~0, es, offsetof(s_checksum))
-        let computed = ext4_chksum(!0u32, &raw_region[..0x3FC]);
+        let computed = ext4_chksum(!0u32, &raw_region[..EXT4_SB_CHECKSUM_OFFSET]);
         if computed != self.checksum {
             return Err(ParseError::InvalidField {
                 field: "s_checksum",

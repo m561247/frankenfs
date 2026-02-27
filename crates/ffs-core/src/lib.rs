@@ -42,8 +42,8 @@ use ffs_ondisk::{
     parse_sys_chunk_array,
 };
 use ffs_types::{
-    BlockNumber, ByteOffset, CommitSeq, EXT4_EXTENTS_FL, GroupNumber, InodeNumber, ParseError,
-    Snapshot,
+    BlockNumber, ByteOffset, CommitSeq, EXT4_EXTENTS_FL, EXT4_SB_CHECKSUM_OFFSET, EXT4_SECTOR_SIZE,
+    GroupNumber, InodeNumber, ParseError, Snapshot,
 };
 use ffs_xattr::XattrWriteAccess;
 use parking_lot::{Mutex, RwLock};
@@ -914,7 +914,7 @@ impl OpenFs {
                 let freed_sectors = if inode.is_huge_file() {
                     freed
                 } else {
-                    freed.saturating_mul(u64::from(alloc.geo.block_size / 512))
+                    freed.saturating_mul(u64::from(alloc.geo.block_size / EXT4_SECTOR_SIZE))
                 };
                 inode.blocks = inode.blocks.saturating_sub(freed_sectors);
             }
@@ -1018,8 +1018,9 @@ impl OpenFs {
 
         if let FsFlavor::Ext4(sb) = &mut self.flavor {
             if sb.has_metadata_csum() {
-                let csum = ffs_ondisk::ext4_chksum(!0u32, &sb_region[..0x3FC]);
-                sb_region[0x3FC..0x400].copy_from_slice(&csum.to_le_bytes());
+                let csum = ffs_ondisk::ext4_chksum(!0u32, &sb_region[..EXT4_SB_CHECKSUM_OFFSET]);
+                sb_region[EXT4_SB_CHECKSUM_OFFSET..EXT4_SB_CHECKSUM_OFFSET + 4]
+                    .copy_from_slice(&csum.to_le_bytes());
                 sb.checksum = csum;
             }
             sb.state = new_state;
@@ -3315,7 +3316,9 @@ fn btrfs_mutation_to_ffs(e: &BtrfsMutationError) -> FfsError {
 fn inode_to_attr(sb: &Ext4Superblock, ino: InodeNumber, inode: &Ext4Inode) -> InodeAttr {
     let kind = inode_file_type(inode);
     let blocks_512 = if (inode.flags & ffs_types::EXT4_HUGE_FILE_FL) != 0 {
-        inode.blocks.saturating_mul(u64::from(sb.block_size / 512))
+        inode
+            .blocks
+            .saturating_mul(u64::from(sb.block_size / EXT4_SECTOR_SIZE))
     } else {
         inode.blocks
     };
@@ -3786,7 +3789,7 @@ impl OpenFs {
         if new_inode.is_huge_file() {
             new_inode.blocks = 1;
         } else {
-            new_inode.blocks = u64::from(bs / 512);
+            new_inode.blocks = u64::from(bs / EXT4_SECTOR_SIZE);
         }
         new_inode.links_count = 2; // . and parent
         {
@@ -3948,7 +3951,7 @@ impl OpenFs {
         if parent_upd.is_huge_file() {
             parent_upd.blocks += 1;
         } else {
-            parent_upd.blocks += u64::from(alloc.geo.block_size / 512);
+            parent_upd.blocks += u64::from(alloc.geo.block_size / EXT4_SECTOR_SIZE);
         }
         ffs_inode::touch_mtime_ctime(&mut parent_upd, tstamp_secs, tstamp_nanos);
         ffs_inode::write_inode(
@@ -4311,7 +4314,7 @@ impl OpenFs {
             .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
         let csum_seed = sb.csum_seed();
         let block_size = u64::from(sb.block_size);
-        let sectors_per_block = u64::from(sb.block_size / 512);
+        let sectors_per_block = u64::from(sb.block_size / EXT4_SECTOR_SIZE);
 
         if length == 0 {
             return Ok(());
@@ -4596,7 +4599,7 @@ impl OpenFs {
                     if inode.is_huge_file() {
                         inode.blocks += 1;
                     } else {
-                        inode.blocks += u64::from(block_size / 512);
+                        inode.blocks += u64::from(block_size / EXT4_SECTOR_SIZE);
                     }
                     BlockNumber(mapping.physical_start)
                 }
@@ -4962,7 +4965,7 @@ impl OpenFs {
                     } else {
                         inode.blocks = inode
                             .blocks
-                            .saturating_sub(freed * u64::from(block_size / 512));
+                            .saturating_sub(freed * u64::from(block_size / EXT4_SECTOR_SIZE));
                     }
                 } else {
                     // Extend: just update size (sparse — blocks allocated on write).
@@ -5090,7 +5093,9 @@ impl OpenFs {
                 if inode.is_huge_file() {
                     inode.blocks = inode.blocks.saturating_add(1);
                 } else {
-                    inode.blocks = inode.blocks.saturating_add(u64::from(block_size / 512));
+                    inode.blocks = inode
+                        .blocks
+                        .saturating_add(u64::from(block_size / EXT4_SECTOR_SIZE));
                 }
 
                 ffs_xattr::set_xattr(
@@ -5215,7 +5220,9 @@ impl OpenFs {
             if inode.is_huge_file() {
                 inode.blocks = inode.blocks.saturating_sub(1);
             } else {
-                inode.blocks = inode.blocks.saturating_sub(u64::from(geo.block_size / 512));
+                inode.blocks = inode
+                    .blocks
+                    .saturating_sub(u64::from(geo.block_size / EXT4_SECTOR_SIZE));
             }
         } else if old_refcount > 1 {
             // Block modified but shared — COW.

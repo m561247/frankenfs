@@ -1689,7 +1689,9 @@ mod tests {
     use crate::symbol::RepairGroupDescExt;
     use ffs_block::{ArcCache, ArcWritePolicy, BlockBuf, RepairFlushLifecycle};
     use ffs_ondisk::{Ext4IncompatFeatures, Ext4RoCompatFeatures};
-    use ffs_types::{EXT4_SUPER_MAGIC, EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE};
+    use ffs_types::{
+        EXT4_SB_CHECKSUM_OFFSET, EXT4_SUPER_MAGIC, EXT4_SUPERBLOCK_OFFSET, EXT4_SUPERBLOCK_SIZE,
+    };
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::{Arc, Mutex};
 
@@ -1814,8 +1816,9 @@ mod tests {
         sb[0x64..0x68].copy_from_slice(&Ext4RoCompatFeatures::METADATA_CSUM.0.to_le_bytes());
         sb[0x175] = 1; // checksum_type=crc32c
 
-        let checksum = ffs_ondisk::ext4_chksum(!0_u32, &sb[..0x3FC]);
-        sb[0x3FC..0x400].copy_from_slice(&checksum.to_le_bytes());
+        let checksum = ffs_ondisk::ext4_chksum(!0_u32, &sb[..EXT4_SB_CHECKSUM_OFFSET]);
+        sb[EXT4_SB_CHECKSUM_OFFSET..EXT4_SB_CHECKSUM_OFFSET + 4]
+            .copy_from_slice(&checksum.to_le_bytes());
         sb
     }
 

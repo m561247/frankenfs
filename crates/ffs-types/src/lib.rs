@@ -9,6 +9,18 @@ pub const EXT4_SUPERBLOCK_OFFSET: usize = 1024;
 pub const EXT4_SUPERBLOCK_SIZE: usize = 1024;
 pub const EXT4_SUPER_MAGIC: u16 = 0xEF53;
 
+/// Sector size for ext4 `i_blocks` accounting.
+///
+/// The `i_blocks` field counts in 512-byte units regardless of fs block size
+/// (unless the `huge_file` flag promotes to fs-block units).
+pub const EXT4_SECTOR_SIZE: u32 = 512;
+
+/// Byte offset of `s_checksum` within the ext4 superblock.
+///
+/// The kernel CRC32C-checksums `sb[..0x3FC]` and stores the result at
+/// `sb[0x3FC..0x400]`.
+pub const EXT4_SB_CHECKSUM_OFFSET: usize = 0x3FC;
+
 pub const BTRFS_SUPER_INFO_OFFSET: usize = 64 * 1024;
 pub const BTRFS_SUPER_INFO_SIZE: usize = 4096;
 pub const BTRFS_MAGIC: u64 = 0x4D5F_5366_5248_425F;
