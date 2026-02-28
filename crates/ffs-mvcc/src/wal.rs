@@ -246,6 +246,7 @@ pub enum DecodeResult {
 ///
 /// Returns the decoded commit and the number of bytes consumed, or an error.
 #[must_use]
+#[expect(clippy::too_many_lines)]
 pub fn decode_commit(bytes: &[u8]) -> DecodeResult {
     if bytes.is_empty() {
         return DecodeResult::EndOfData;
@@ -261,8 +262,15 @@ pub fn decode_commit(bytes: &[u8]) -> DecodeResult {
         Err(e) => return DecodeResult::Corrupted(format!("failed to read record length: {e}")),
     };
 
-    // Zero record length indicates end of data
+    // Zero record length indicates end of valid data only when the remaining
+    // tail is all zeros (preallocated/empty). Non-zero tail bytes indicate
+    // corruption and should not be silently ignored.
     if record_len == 0 {
+        if bytes[4..].iter().any(|&b| b != 0) {
+            return DecodeResult::Corrupted(
+                "zero record length followed by non-zero tail".to_owned(),
+            );
+        }
         return DecodeResult::EndOfData;
     }
 
@@ -275,9 +283,7 @@ pub fn decode_commit(bytes: &[u8]) -> DecodeResult {
     }
 
     let Some(total_size) = 4_usize.checked_add(record_len) else {
-        return DecodeResult::Corrupted(format!(
-            "record_len overflows total size: {record_len}"
-        ));
+        return DecodeResult::Corrupted(format!("record_len overflows total size: {record_len}"));
     };
     if bytes.len() < total_size {
         return DecodeResult::NeedMore(total_size);
@@ -384,6 +390,11 @@ pub fn decode_commit(bytes: &[u8]) -> DecodeResult {
         writes.push(WalWrite { block, data });
     }
 
+    if offset != crc_offset {
+        let trailing = crc_offset.saturating_sub(offset);
+        return DecodeResult::Corrupted(format!("trailing payload bytes before CRC: {trailing}"));
+    }
+
     DecodeResult::Commit(WalCommit {
         commit_seq,
         txn_id,
@@ -401,7 +412,7 @@ pub fn commit_byte_size(bytes: &[u8]) -> Option<usize> {
     if record_len == 0 {
         return None;
     }
-    Some(4 + record_len)
+    4_usize.checked_add(record_len)
 }
 
 // ── Helper functions ──────────────────────────────────────────────────────────
@@ -566,6 +577,22 @@ mod tests {
         match result {
             DecodeResult::EndOfData => {}
             other => panic!("expected EndOfData, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_zero_record_length_with_nonzero_tail_is_corrupted() {
+        let mut bytes = [0_u8; 16];
+        bytes[8] = 1;
+        let result = decode_commit(&bytes);
+        match result {
+            DecodeResult::Corrupted(msg) => {
+                assert!(
+                    msg.contains("zero record length"),
+                    "expected zero-length corruption message, got: {msg}"
+                );
+            }
+            other => panic!("expected Corrupted, got {other:?}"),
         }
     }
 
@@ -742,6 +769,37 @@ mod tests {
                 assert!(
                     msg.contains("exceeds body capacity"),
                     "expected 'exceeds body capacity' in: {msg}"
+                );
+            }
+            other => panic!("expected Corrupted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_commit_rejects_trailing_payload_before_crc() {
+        let commit = WalCommit {
+            commit_seq: CommitSeq(7),
+            txn_id: TxnId(9),
+            writes: vec![],
+        };
+        let mut encoded = encode_commit(&commit).expect("encode");
+
+        // Inject one payload byte before CRC, then restamp record_len + CRC so
+        // corruption is structural (not just checksum mismatch).
+        let crc_start = encoded.len() - 4;
+        encoded.insert(crc_start, 0xAA);
+        let record_len = u32::try_from(encoded.len() - 4).expect("record_len u32");
+        encoded[0..4].copy_from_slice(&record_len.to_le_bytes());
+        let crc_range_end = encoded.len() - 4;
+        let crc = crc32c::crc32c(&encoded[4..crc_range_end]);
+        encoded[crc_range_end..].copy_from_slice(&crc.to_le_bytes());
+
+        let result = decode_commit(&encoded);
+        match result {
+            DecodeResult::Corrupted(msg) => {
+                assert!(
+                    msg.contains("trailing payload"),
+                    "expected trailing payload corruption message, got: {msg}"
                 );
             }
             other => panic!("expected Corrupted, got {other:?}"),

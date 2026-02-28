@@ -58,6 +58,7 @@ use tracing::{debug, error, info, trace, warn};
 
 // Degradation/pressure types are in degradation.rs, re-exported above.
 // VFS types and FsOps trait are in vfs.rs, re-exported above.
+const LINUX_PATH_MAX: u64 = 4096;
 
 /// Detected filesystem type with the parsed superblock embedded.
 ///
@@ -6975,7 +6976,9 @@ impl FsOps for OpenFs {
                 if attr.kind != FileType::Symlink {
                     return Err(FfsError::Format("not a symlink".into()));
                 }
-                let read_size = u32::try_from(attr.size).unwrap_or(u32::MAX);
+                // PATH_MAX is 4096 on Linux; symlinks cannot exceed this.
+                let capped = attr.size.min(LINUX_PATH_MAX);
+                let read_size = u32::try_from(capped).unwrap_or(4096);
                 let mut target = self.btrfs_read_file(cx, ino, 0, read_size)?;
                 if let Some(nul) = target.iter().position(|b| *b == 0) {
                     target.truncate(nul);
@@ -7588,7 +7591,17 @@ pub fn verify_ext4_integrity(image: &[u8], max_inodes: u32) -> Result<IntegrityR
                 // Read raw GD bytes for checksum verification
                 if let Some(gd_off) = sb.group_desc_offset(group) {
                     let ds = usize::from(desc_size);
-                    let offset = usize::try_from(gd_off).unwrap_or(usize::MAX);
+                    let Ok(offset) = usize::try_from(gd_off) else {
+                        verdicts.push(CheckVerdict {
+                            component: format!("group_desc[{g}]"),
+                            passed: false,
+                            detail: format!(
+                                "group descriptor offset {gd_off} exceeds addressable range"
+                            ),
+                        });
+                        failed += 1;
+                        continue;
+                    };
                     if offset.saturating_add(ds) <= image.len() {
                         let raw_gd = &image[offset..offset + ds];
                         match ffs_ondisk::verify_group_desc_checksum(
@@ -7678,8 +7691,9 @@ pub fn verify_ext4_integrity(image: &[u8], max_inodes: u32) -> Result<IntegrityR
         let bitmap = inode_bitmap_cache.entry(group_idx).or_insert_with(|| {
             let group = ffs_types::GroupNumber(group_idx);
             if let Ok(gd) = reader.read_group_desc(image, group) {
-                let bm_off = usize::try_from(gd.inode_bitmap * u64::from(sb.block_size))
-                    .unwrap_or(usize::MAX);
+                let Ok(bm_off) = usize::try_from(gd.inode_bitmap * u64::from(sb.block_size)) else {
+                    return Vec::new();
+                };
                 if bm_off.saturating_add(block_size_usize) <= image.len() {
                     return image[bm_off..bm_off + block_size_usize].to_vec();
                 }
@@ -7702,7 +7716,16 @@ pub fn verify_ext4_integrity(image: &[u8], max_inodes: u32) -> Result<IntegrityR
                     let local = (ino - 1) % sb.inodes_per_group;
                     let itable_off = gd.inode_table * u64::from(sb.block_size);
                     let inode_off = itable_off + u64::from(local) * inode_size as u64;
-                    let off = usize::try_from(inode_off).unwrap_or(usize::MAX);
+                    let Ok(off) = usize::try_from(inode_off) else {
+                        verdicts.push(CheckVerdict {
+                            component: format!("inode[{ino}]"),
+                            passed: false,
+                            detail: format!("inode offset {inode_off} exceeds addressable range"),
+                        });
+                        inodes_corrupt += 1;
+                        failed += 1;
+                        continue;
+                    };
                     if off.saturating_add(inode_size) <= image.len() {
                         let raw = &image[off..off + inode_size];
                         match ffs_ondisk::verify_inode_checksum(

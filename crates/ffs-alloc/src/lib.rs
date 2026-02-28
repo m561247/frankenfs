@@ -840,9 +840,23 @@ pub fn alloc_inode(
         parent_group
     };
 
-    // Try target group, then scan.
+    // Try target group.
     if let Some(alloc) = try_alloc_inode_in_group(cx, dev, geo, groups, target_group)? {
         return Ok(alloc);
+    }
+
+    // Try nearby groups (within 8 groups of target).
+    for delta in 1..=8u32 {
+        for dir in [1i64, -1i64] {
+            let g = i64::from(target_group.0) + dir * i64::from(delta);
+            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            if g >= 0 && (g as u32) < geo.group_count {
+                let group = GroupNumber(g as u32);
+                if let Some(alloc) = try_alloc_inode_in_group(cx, dev, geo, groups, group)? {
+                    return Ok(alloc);
+                }
+            }
+        }
     }
 
     // Scan all groups.
@@ -965,6 +979,20 @@ pub fn alloc_inode_persist(
     if let Some(alloc) = try_alloc_inode_in_group_persist(cx, dev, geo, groups, target_group, pctx)?
     {
         return Ok(alloc);
+    }
+
+    // Try nearby groups (within 8 groups of target).
+    for delta in 1..=8u32 {
+        for dir in [1i64, -1i64] {
+            let g = i64::from(target_group.0) + dir * i64::from(delta);
+            #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            if g >= 0 && (g as u32) < geo.group_count {
+                let group = GroupNumber(g as u32);
+                if let Some(alloc) = try_alloc_inode_in_group_persist(cx, dev, geo, groups, group, pctx)? {
+                    return Ok(alloc);
+                }
+            }
+        }
     }
 
     for g in 0..geo.group_count {
@@ -3055,6 +3083,86 @@ mod tests {
                 result.is_err(),
                 "free_blocks should reject extent crossing group boundary"
             );
+        }
+
+        /// `bitmap_find_free` with start >= count is clamped and doesn't panic.
+        #[test]
+        fn proptest_bitmap_find_free_start_past_count(
+            (ref bm, count) in bitmap_strat(),
+            excess in 0_u32..1000,
+        ) {
+            let start = count.saturating_add(excess);
+            // Must not panic. Result correctness: wraps to scan 0..count.
+            if let Some(pos) = bitmap_find_free(bm, count, start) {
+                prop_assert!(pos < count, "found pos {} >= count {}", pos, count);
+                prop_assert!(!bitmap_get(bm, pos));
+            }
+        }
+
+        /// `bitmap_find_contiguous` with start past end still finds runs.
+        #[test]
+        fn proptest_bitmap_find_contiguous_start_past_count(
+            n in 1_u32..8,
+        ) {
+            let count = 32_u32;
+            let bm = vec![0u8; 4]; // all free
+            let result = bitmap_find_contiguous(&bm, count, n, count + 100);
+            // All bits free, so a contiguous run of n should be found.
+            prop_assert!(result.is_some(), "should find {} contiguous in all-free bitmap", n);
+            let start = result.unwrap();
+            prop_assert!(start + n <= count);
+        }
+
+        /// `bitmap_count_free` on a zero-length bitmap returns 0.
+        #[test]
+        fn proptest_bitmap_count_free_zero_count(ref bm in proptest::collection::vec(any::<u8>(), 0..32)) {
+            prop_assert_eq!(bitmap_count_free(bm, 0), 0);
+        }
+
+        /// bitmap_find_free on zero-count bitmap returns None.
+        #[test]
+        fn proptest_bitmap_find_free_zero_count(start in any::<u32>()) {
+            let bm = vec![0u8; 4];
+            prop_assert!(bitmap_find_free(&bm, 0, start).is_none());
+        }
+
+        /// When `count` extends beyond bitmap capacity, out-of-range bits are
+        /// treated as allocated and must not inflate free-bit counts.
+        #[test]
+        fn proptest_bitmap_count_free_overscan_matches_manual(
+            bm in proptest::collection::vec(any::<u8>(), 1..32),
+            extra in 1_u32..256,
+        ) {
+            let bit_len = u32::try_from(bm.len() * 8).expect("bitmap bit length fits in u32");
+            let count = bit_len.saturating_add(extra);
+            let free = bitmap_count_free(&bm, count);
+            let manual_free = (0..count).fold(0_u32, |acc, i| acc + u32::from(!bitmap_get(&bm, i)));
+            prop_assert_eq!(free, manual_free);
+        }
+
+        /// If a contiguous run request exceeds `count`, allocator must return None.
+        #[test]
+        fn proptest_bitmap_find_contiguous_n_exceeds_count_returns_none(
+            (ref bm, count) in bitmap_strat(),
+            extra in 1_u32..64,
+            start_seed in any::<u32>(),
+        ) {
+            let n = count.saturating_add(extra);
+            let start = if count == 0 { 0 } else { start_seed % count };
+            let found = bitmap_find_contiguous(bm, count, n, start);
+            prop_assert_eq!(found, None);
+        }
+
+        /// Empty bitmap with non-zero `count` should report no free slots.
+        #[test]
+        fn proptest_empty_bitmap_nonzero_count_has_no_free(
+            count in 1_u32..1024,
+            start in any::<u32>(),
+        ) {
+            let bm: Vec<u8> = Vec::new();
+            prop_assert_eq!(bitmap_count_free(&bm, count), 0);
+            prop_assert_eq!(bitmap_find_free(&bm, count, start), None);
+            prop_assert_eq!(bitmap_find_contiguous(&bm, count, 1, start), None);
         }
     }
 }

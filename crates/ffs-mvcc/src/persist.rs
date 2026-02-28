@@ -272,6 +272,7 @@ impl PersistentMvccStore {
             // Replay WAL entries that are newer than the checkpoint
             let checkpoint_seq = store.next_commit.saturating_sub(1);
             let (pos, replay_stats) = replay_wal_from_seq(&mut file, &mut store, checkpoint_seq)?;
+            truncate_wal_tail_if_needed(&file, pos, wal_total_bytes)?;
             write_pos = pos;
             stats.replayed_commits = replay_stats.commits_replayed;
             stats.replayed_versions = replay_stats.versions_replayed;
@@ -328,6 +329,7 @@ impl PersistentMvccStore {
         if exists && wal_total_bytes > 0 {
             // Replay existing WAL
             let (pos, replay_stats) = replay_wal(&mut file, &mut store)?;
+            truncate_wal_tail_if_needed(&file, pos, wal_total_bytes)?;
             write_pos = pos;
             stats.replayed_commits = replay_stats.commits_replayed;
             stats.replayed_versions = replay_stats.versions_replayed;
@@ -938,12 +940,15 @@ fn replay_wal_from_seq(
     let mut commits_replayed = 0_u64;
     let mut versions_replayed = 0_u64;
     let mut records_discarded = 0_u64;
+    let mut last_replayed_seq = skip_up_to_seq;
 
     while offset < data.len() {
         match wal::decode_commit(&data[offset..]) {
             DecodeResult::Commit(commit) => {
-                let size = wal::commit_byte_size(&data[offset..])
-                    .ok_or_else(|| FfsError::Format("failed to get commit size".to_owned()))?;
+                let Some(size) = wal::commit_byte_size(&data[offset..]) else {
+                    records_discarded += 1;
+                    break;
+                };
                 offset += size;
 
                 // Skip commits already in the checkpoint
@@ -951,8 +956,22 @@ fn replay_wal_from_seq(
                     continue;
                 }
 
+                // WAL replay must remain strictly monotonic; duplicate or
+                // descending commit sequences indicate a malformed tail.
+                if commit.commit_seq.0 <= last_replayed_seq {
+                    records_discarded += 1;
+                    break;
+                }
+
+                // Reserve u64::MAX so in-memory counters can always advance.
+                if commit.commit_seq.0 == u64::MAX || commit.txn_id.0 == u64::MAX {
+                    records_discarded += 1;
+                    break;
+                }
+
                 // Apply this commit to the store
                 apply_wal_commit(store, &commit);
+                last_replayed_seq = commit.commit_seq.0;
                 commits_replayed += 1;
                 versions_replayed += u64::try_from(commit.writes.len()).unwrap_or(u64::MAX);
             }
@@ -989,6 +1008,14 @@ fn replay_wal_from_seq(
             records_discarded,
         },
     ))
+}
+
+fn truncate_wal_tail_if_needed(file: &File, valid_bytes: u64, total_bytes: u64) -> Result<()> {
+    if total_bytes > valid_bytes {
+        file.set_len(valid_bytes)?;
+        file.sync_all()?;
+    }
+    Ok(())
 }
 
 /// Apply a WAL commit record to an MvccStore.
@@ -1645,6 +1672,87 @@ mod tests {
             assert_eq!(report.records_discarded, 1);
             assert!(report.wal_total_bytes > report.wal_valid_bytes);
         }
+    }
+
+    #[test]
+    fn replay_truncates_discarded_tail_from_wal() {
+        let cx = test_cx();
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+
+        // Write two commits.
+        {
+            let store = PersistentMvccStore::open(&cx, &path).expect("open");
+            let mut txn = store.begin();
+            txn.stage_write(BlockNumber(1), vec![1; 32]);
+            store.commit(txn).expect("commit 1");
+
+            let mut txn = store.begin();
+            txn.stage_write(BlockNumber(2), vec![2; 32]);
+            store.commit(txn).expect("commit 2");
+        }
+
+        // Corrupt the tail by truncating the second record.
+        {
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("open for truncate");
+            let len = file.metadata().expect("metadata").len();
+            file.set_len(len - 10).expect("truncate");
+        }
+
+        // First reopen should discard one record and trim file to valid bytes.
+        {
+            let store = PersistentMvccStore::open(&cx, &path).expect("reopen");
+            let report = store.recovery_report();
+            assert_eq!(report.commits_replayed, 1);
+            assert_eq!(report.records_discarded, 1);
+
+            let len_after = std::fs::metadata(&path).expect("metadata").len();
+            assert_eq!(len_after, report.wal_valid_bytes);
+        }
+
+        // Second reopen should not rediscard the same tail.
+        {
+            let store = PersistentMvccStore::open(&cx, &path).expect("reopen again");
+            let report = store.recovery_report();
+            assert_eq!(report.records_discarded, 0);
+            assert_eq!(report.commits_replayed, 1);
+        }
+    }
+
+    #[test]
+    fn replay_discards_duplicate_commit_sequence() {
+        let cx = test_cx();
+        let tmp = NamedTempFile::new().expect("create temp file");
+        let path = tmp.path().to_path_buf();
+
+        let commit = WalCommit {
+            commit_seq: CommitSeq(1),
+            txn_id: ffs_types::TxnId(1),
+            writes: vec![crate::wal::WalWrite {
+                block: BlockNumber(7),
+                data: vec![9; 16],
+            }],
+        };
+        let encoded_commit = wal::encode_commit(&commit).expect("encode commit");
+
+        // Build WAL manually: header + commit + duplicate commit.
+        {
+            let mut bytes = Vec::from(wal::encode_header(&WalHeader::default()));
+            bytes.extend_from_slice(&encoded_commit);
+            bytes.extend_from_slice(&encoded_commit);
+            std::fs::write(&path, &bytes).expect("write WAL");
+        }
+
+        let store = PersistentMvccStore::open(&cx, &path).expect("reopen");
+        let report = store.recovery_report();
+        assert_eq!(report.commits_replayed, 1);
+        assert_eq!(report.records_discarded, 1);
+
+        let snap = store.current_snapshot();
+        assert_eq!(store.read_visible(BlockNumber(7), snap), Some(vec![9; 16]));
     }
 
     #[test]
