@@ -2089,7 +2089,11 @@ pub fn parse_extent_tree(bytes: &[u8]) -> Result<(Ext4ExtentHeader, ExtentTree),
     if header.depth == 0 {
         let mut extents = Vec::with_capacity(entries_len);
         for idx in 0..entries_len {
-            let base = 12 + idx * 12;
+            // entries_len is from u16 so idx*12 fits in usize, but be explicit.
+            let base = 12 + idx.checked_mul(12).ok_or(ParseError::InvalidField {
+                field: "extent_entries",
+                reason: "entry offset overflow",
+            })?;
             let logical_block = read_le_u32(bytes, base)?;
             let raw_len = read_le_u16(bytes, base + 4)?;
             let start_hi = u64::from(read_le_u16(bytes, base + 6)?);
@@ -2107,7 +2111,10 @@ pub fn parse_extent_tree(bytes: &[u8]) -> Result<(Ext4ExtentHeader, ExtentTree),
     } else {
         let mut indexes = Vec::with_capacity(entries_len);
         for idx in 0..entries_len {
-            let base = 12 + idx * 12;
+            let base = 12 + idx.checked_mul(12).ok_or(ParseError::InvalidField {
+                field: "extent_indexes",
+                reason: "index offset overflow",
+            })?;
             let logical_block = read_le_u32(bytes, base)?;
             let leaf_lo = u64::from(read_le_u32(bytes, base + 4)?);
             let leaf_hi = u64::from(read_le_u16(bytes, base + 8)?);
